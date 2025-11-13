@@ -1,0 +1,2001 @@
+---
+title: "r code for Exposure-dependent immune thresholds define protection across transmission intensities"
+output: html_notebook
+---
+
+# 01_data_preparation.R
+
+```{r}
+
+  library(readxl)
+  library(dplyr)
+  library(lubridate)
+  library(DescTools)
+  library(ggplot2)
+
+# ---- 0) Path ----
+
+file_path <- '[insert filepath]'
+
+# ---- 1) Read + normalization ----
+df_raw <- read.csv(file_path) 
+
+df <- df_raw %>%
+  mutate(
+    across(c(age, dpso, dpv, pcr_pos), ~as.numeric(.)),
+    date = as.Date(date),
+    gender = as.factor(gender),
+    province = as.factor(province)
+  )
+
+
+# ---- 2) Primary analysis subset ----
+data <- df %>%
+  filter(date > as.Date("2021-04-13")) %>%
+  transmute(
+    date, s_titer_geom, s_titer_nonlog,
+    vacc_dose, vacc_dose_orig, s_pos, dpso, age,
+    setting, gender, province, pcr_pos, dpv,
+    year_biweek = year(date) * 100 + ceiling(yday(date) / 14),
+    vaccinated  = as.integer(vacc_dose != "0"),
+    date_num    = as.numeric(difftime(date, min(date, na.rm = TRUE), units = "days")),
+    age_cat     = cut(age,
+                      breaks = c(2, 18, 55, Inf),
+                      labels = c("2–17", "18–54", "≥55"),
+                      right = FALSE)
+  )
+
+# ---- 3) Biweekly percent positive (site/period transmission proxy) ----
+biweekly_data <- data %>%
+  group_by(year_biweek) %>%
+  summarise(
+    percent_positive = mean(pcr_pos, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+# ---- 4) Join transmission intensity + keep periods with any positives ----
+data <- data %>%
+  left_join(biweekly_data, by = "year_biweek") %>%
+  filter(percent_positive > 0)
+
+# ---- 5) Valid-test window among PCR-positives (avoid early anamnestic response bias) ----
+data <- data %>%
+  filter(pcr_pos == 0 | (pcr_pos == 1 & dpso < 5))
+
+# ---- 6) Variant period + transmission strata ----
+data <- data %>%
+  mutate(
+    variant_period = case_when(
+      date >= as.Date("2021-04-13") & date <= as.Date("2021-08-14") ~ "Mu",
+      date >= as.Date("2021-08-15") & date <= as.Date("2021-12-20") ~ "Delta",
+      date >= as.Date("2021-12-21") & date <= as.Date("2022-04-15") ~ "BA.1",
+      date >= as.Date("2022-04-16") & date <= as.Date("2022-08-17") ~ "BA.4/5",
+      TRUE ~ NA_character_
+    ),
+    variant_period = factor(variant_period,
+                            levels = c("Mu", "Delta", "BA.1", "BA.4/5"),
+                            ordered = TRUE),
+    transmission_intensity_biweek2 = cut(
+      percent_positive,
+      breaks = c(-Inf, 15, Inf),
+      labels = c("Low", "High"),
+      include.lowest = TRUE,
+      right = TRUE
+    )
+  )
+
+# ---- 7) PCR positivity summary table by transmission intensity ----
+pcr_summary <- data %>%
+  group_by(transmission_intensity_biweek2) %>%
+  summarise(
+    Total_N               = n(),
+    PCR_Positive_N        = sum(pcr_pos == 1, na.rm = TRUE),
+    PCR_Positive_Percent  = round(100 * PCR_Positive_N / Total_N, 1),
+    Percent_Positive_Min  = round(min(percent_positive, na.rm = TRUE), 1),
+    Percent_Positive_Max  = round(max(percent_positive, na.rm = TRUE), 1),
+    Weeks_in_Category     = n_distinct(year_biweek) * 2,
+    .groups = "drop"
+  ) %>%
+  janitor::adorn_totals("row")
+
+# ---- 8) Interactions, bins) ----
+data <- data %>%
+  mutate(
+    dpv_vacc_interaction = interaction(dpv, vaccinated, drop = TRUE),
+    dpv_vacc_interaction_numeric = as.integer(dpv_vacc_interaction),
+    dpv_vacc_interaction_category = case_when(
+      vaccinated == 0L ~ "NV",
+      dpv_vacc_interaction_numeric <= 29.5  ~ "<30",
+      dpv_vacc_interaction_numeric <= 179.5 ~ "30–179",
+      dpv_vacc_interaction_numeric <= 359.5 ~ "180–359",
+      TRUE ~ "360+"
+    )
+  )
+
+
+```
+
+# 02_summary_stats.R
+
+```{r}
+
+has_DescTools <- requireNamespace("DescTools", quietly = TRUE)
+
+
+# ---------- 1) Transmission summaries by variant period ----------
+summary_transmission_by_variant <- data %>%
+  group_by(variant_period) %>%
+  summarise(
+    n_rows              = n(),
+    n_biweeks           = n_distinct(year_biweek),
+    median_transmission = median(percent_positive, na.rm = TRUE),
+    mean_transmission   = mean(percent_positive, na.rm = TRUE),
+    min_transmission    = min(percent_positive, na.rm = TRUE),
+    max_transmission    = max(percent_positive, na.rm = TRUE),
+    range_transmission  = max_transmission - min_transmission,
+    .groups = "drop"
+  )
+
+print(summary_transmission_by_variant)
+
+# ---------- 2) Overall study period length (by observed dates) ----------
+study_start <- min(data$date, na.rm = TRUE)
+study_end   <- max(data$date, na.rm = TRUE)
+n_weeks_span <- as.numeric(difftime(study_end, study_start, units = "weeks"))
+
+
+# ---------- 3) Case / non-case counts and proportions with 95% CI ----------
+N_total <- nrow(data)
+N_cases <- sum(data$pcr_pos == 1, na.rm = TRUE)
+N_ctrls <- sum(data$pcr_pos == 0, na.rm = TRUE)
+
+p_cases <- N_cases / N_total
+p_ctrls <- N_ctrls / N_total
+
+if (has_DescTools) {
+  ci_cases <- DescTools::BinomCI(N_cases, N_total, method = "clopper-pearson")
+  ci_ctrls <- DescTools::BinomCI(N_ctrls, N_total, method = "clopper-pearson")
+
+  cat(sprintf("Cases:      N=%d (%.2f%%; 95%% CI %.2f–%.2f%%)\n",
+              N_cases, 100*p_cases, 100*ci_cases[1, "lwr.ci"], 100*ci_cases[1, "upr.ci"]))
+  cat(sprintf("Non-cases:  N=%d (%.2f%%; 95%% CI %.2f–%.2f%%)\n",
+              N_ctrls, 100*p_ctrls, 100*ci_ctrls[1, "lwr.ci"], 100*ci_ctrls[1, "upr.ci"]))
+} else {
+  # Base R exact CIs via binom.test()
+  bt_cases <- stats::binom.test(N_cases, N_total)
+  bt_ctrls <- stats::binom.test(N_ctrls, N_total)
+
+  cat(sprintf("Cases:      N=%d (%.2f%%; 95%% CI %.2f–%.2f%%)\n",
+              N_cases, 100*p_cases, 100*bt_cases$conf.int[1]*100, 100*bt_cases$conf.int[2]*100))
+  cat(sprintf("Non-cases:  N=%d (%.2f%%; 95%% CI %.2f–%.2f%%)\n",
+              N_ctrls, 100*p_ctrls, 100*bt_ctrls$conf.int[1]*100, 100*bt_ctrls$conf.int[2]*100))
+  cat("Note: Install DescTools for additional CI methods.\n")
+}
+
+
+# ---------- 4) Case/non-case distribution across transmission strata ----------
+xt_trans <- table(data$transmission_intensity_biweek2, data$pcr_pos, useNA = "ifany")
+colnames(xt_trans) <- c("Non-case (pcr_pos=0)", "Case (pcr_pos=1)")
+print(xt_trans)
+
+# ---------- 5) Number of biweeks in each transmission stratum ----------
+weeks_by_trans <- data %>%
+  group_by(transmission_intensity_biweek2) %>%
+  summarise(n_biweeks = n_distinct(year_biweek), .groups = "drop") %>%
+  mutate(weeks = n_biweeks * 2) # each biweek ≈ 2 weeks
+
+print(weeks_by_trans)
+
+# ---------- 6) Antibody summary stats (overall, cases, non-cases) ----------
+Gmean_simple <- function(x) exp(mean(log(x[x > 0]), na.rm = TRUE))
+
+gmean_ci <- function(x, conf.level = 0.95) {
+  x <- x[is.finite(x) & x > 0]
+  if (has_DescTools) {
+    ci <- tryCatch(DescTools::GmeanCI(x, conf.level = conf.level), error = function(e) NULL)
+    if (!is.null(ci)) return(c(gmean = ci[1], lwr = ci[2], upr = ci[3]))
+  }
+  lx <- log(x)
+  m  <- mean(lx); s <- stats::sd(lx); n <- length(lx)
+  se <- s / sqrt(n)
+  z  <- stats::qnorm(1 - (1 - conf.level)/2)
+  c(gmean = exp(m), lwr = exp(m - z*se), upr = exp(m + z*se))
+}
+
+summarise_titer <- function(df) {
+  gm <- gmean_ci(df$s_titer_nonlog)
+  data.frame(
+    N           = sum(!is.na(df$s_titer_nonlog)),
+    GeoMean     = round(gm["gmean"], 1),
+    GeoMean_LCL = round(gm["lwr"], 1),
+    GeoMean_UCL = round(gm["upr"], 1),
+    Mean        = round(mean(df$s_titer_nonlog, na.rm = TRUE), 1),
+    Mean_LCL    = if (has_DescTools) round(DescTools::MeanCI(df$s_titer_nonlog, na.rm = TRUE)["lwr.ci"], 1) else NA_real_,
+    Mean_UCL    = if (has_DescTools) round(DescTools::MeanCI(df$s_titer_nonlog, na.rm = TRUE)["upr.ci"], 1) else NA_real_,
+    Median      = round(stats::quantile(df$s_titer_nonlog, 0.5, na.rm = TRUE), 1),
+    Q25         = round(stats::quantile(df$s_titer_nonlog, 0.25, na.rm = TRUE), 1),
+    Q75         = round(stats::quantile(df$s_titer_nonlog, 0.75, na.rm = TRUE), 1)
+  )
+}
+
+titer_overall   <- summarise_titer(data)              %>% mutate(Group = "Overall")
+titer_cases     <- summarise_titer(dplyr::filter(data, pcr_pos == 1)) %>% mutate(Group = "Cases")
+titer_controls  <- summarise_titer(dplyr::filter(data, pcr_pos == 0)) %>% mutate(Group = "Non-cases")
+
+titer_summary <- dplyr::bind_rows(titer_overall, titer_cases, titer_controls) %>%
+  relocate(Group)
+
+print(titer_summary)
+
+# ---------- 7) Antibody summaries within transmission strata (Low/High) ----------
+by_trans_group <- function(df, label) {
+  dplyr::bind_rows(
+    summarise_titer(df)                          %>% mutate(Subgroup = "All"),
+    summarise_titer(dplyr::filter(df, pcr_pos==1)) %>% mutate(Subgroup = "Cases"),
+    summarise_titer(dplyr::filter(df, pcr_pos==0)) %>% mutate(Subgroup = "Non-cases")
+  ) %>% mutate(Transmission = label) %>% relocate(Transmission, Subgroup)
+}
+
+data_low  <- dplyr::filter(data, transmission_intensity_biweek2 == "Low")
+data_high <- dplyr::filter(data, transmission_intensity_biweek2 == "High")
+
+titer_by_trans <- dplyr::bind_rows(
+  by_trans_group(data_low,  "Low"),
+  by_trans_group(data_high, "High")
+)
+
+```
+
+# 03_figures_tables_main.R
+
+## Table 1
+
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+})
+
+# ---- Helpers (define ONCE, before using) ----
+gmean_ci <- function(x, conf.level = 0.95) {
+  x <- x[is.finite(x) & x > 0]
+  n <- length(x)
+  if (n == 0L) return(c(gm = NA_real_, lwr = NA_real_, upr = NA_real_, n = 0))
+
+  ci <- tryCatch(DescTools::GmeanCI(x, conf.level = conf.level), error = function(e) NULL)
+  if (!is.null(ci)) return(c(gm = ci[1], lwr = ci[2], upr = ci[3], n = n))
+
+  lx <- log(x)
+  m  <- mean(lx); s <- stats::sd(lx); se <- s / sqrt(n)
+  z  <- stats::qnorm(1 - (1 - conf.level)/2)
+  c(gm = exp(m), lwr = exp(m - z*se), upr = exp(m + z*se), n = n)
+}
+
+summarise_titer_block <- function(df) {
+  gc <- gmean_ci(df$s_titer_nonlog)
+  tibble::tibble(
+    N            = nrow(df),
+    N_posTiters  = as.integer(gc["n"]),
+    GMT          = unname(gc["gm"]),
+    CI_lower     = unname(gc["lwr"]),
+    CI_upper     = unname(gc["upr"]),
+    Median_Titer = stats::quantile(df$s_titer_nonlog, 0.5, na.rm = TRUE),
+    Q1           = stats::quantile(df$s_titer_nonlog, 0.25, na.rm = TRUE),
+    Q3           = stats::quantile(df$s_titer_nonlog, 0.75, na.rm = TRUE)
+  )
+}
+
+# Common factor for NAAT with explicit order
+data <- data %>%
+  mutate(naat = factor(pcr_pos, levels = c(0,1), labels = c("Negative","Positive")))
+
+# ---- Step 1: Per-stratum (Low/High × NAAT) ----
+table_results <- data %>%
+  group_by(transmission_intensity_biweek2, naat, .drop = FALSE) %>%
+  reframe(summarise_titer_block(cur_data_all())) %>%
+  ungroup() %>%
+  group_by(transmission_intensity_biweek2) %>%
+  mutate(
+    # Baseline = Negative subgroup’s GMT (consistent with Methods/Table)
+    baseline = GMT[match("Positive", naat)],
+    Fold_Difference = ifelse(is.finite(baseline), GMT / baseline, NA_real_)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    `GMT (95% CI)` = ifelse(is.finite(GMT),
+                            sprintf("%.2f (%.2f–%.2f)", GMT, CI_lower, CI_upper),
+                            NA_character_),
+    `Median Titer (Q1, Q3)` = sprintf("%.0f (%.0f, %.0f)", Median_Titer, Q1, Q3)
+  ) %>%
+  select(
+    transmission_intensity_biweek2,
+    `SARS-COV-2 NAAT` = naat,
+    N, N_posTiters, `GMT (95% CI)`, Fold_Difference, `Median Titer (Q1, Q3)`
+  )
+
+# ---- Step 2: Totals row (across Low/High, by NAAT), same baseline rule ----
+totals_row <- data %>%
+  group_by(naat) %>%
+  reframe(summarise_titer_block(cur_data_all())) %>%
+  ungroup() %>%
+  mutate(transmission_intensity_biweek2 = "Total") %>%
+  group_by(transmission_intensity_biweek2) %>%
+  mutate(
+    baseline = GMT[match("Negative", naat)],
+    Fold_Difference = ifelse(is.finite(baseline), GMT / baseline, NA_real_)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    `GMT (95% CI)` = ifelse(is.finite(GMT),
+                            sprintf("%.2f (%.2f–%.2f)", GMT, CI_lower, CI_upper),
+                            NA_character_),
+    `Median Titer (Q1, Q3)` = sprintf("%.0f (%.0f, %.0f)", Median_Titer, Q1, Q3)
+  ) %>%
+  select(
+    transmission_intensity_biweek2,
+    `SARS-COV-2 NAAT` = naat,
+    N, N_posTiters, `GMT (95% CI)`, Fold_Difference, `Median Titer (Q1, Q3)`
+  )
+
+# ---- Step 3: Combine + order ----
+final_table <- bind_rows(table_results, totals_row) %>%
+  arrange(factor(transmission_intensity_biweek2, levels = c("Low","High","Total")),
+          `SARS-COV-2 NAAT`)
+
+print(final_table)
+
+```
+
+##Figure 1 Plot 1A
+
+```{r}
+# Convert to an unordered factor first
+data$variant_period <- factor(data$variant_period, 
+                              levels = c("Mu", "Delta", "BA.1", "BA.4/5"), 
+                              ordered = FALSE)
+
+# Set Mu as the reference level
+data$variant_period <- relevel(data$variant_period, ref = "Mu")
+
+
+data$dpv_vacc_interaction <- as.numeric(data$dpv_vacc_interaction)
+
+# Creating the categorical variable based on quantiles for s_titer_geom
+data$s_titer_geom_cat <- cut(data$s_titer_geom, 
+                                           breaks = quantile(data$s_titer_geom, probs = 0:4/4, na.rm = TRUE),
+                                           labels = c("Q1", "Q2", "Q3", "Q4"),
+                                           include.lowest = TRUE)
+
+# Filter out the undesired dose
+data_model_overall <- data %>%
+  filter(vacc_dose != '4')
+
+# Updating the model formula to use the categorical variable instead of the continuous one
+overall_model_gam <- mgcv::gam(pcr_pos ~ s(age) + vacc_dose_orig + s(dpv_vacc_interaction_numeric) + variant_period + s_titer_geom_cat + transmission_intensity_biweek2, 
+                               data = data_model_overall, 
+                               family = "binomial")
+
+# ---- Step 1: Extract Model Estimates ----
+model_summary <- summary(overall_model_gam)
+
+# Extract estimates & standard errors
+coef_values <- model_summary$p.table[, 1]  # Estimates
+std_errors <- model_summary$p.table[, 2]   # Standard Errors
+
+# ---- Step 2: Create Updated Data Frame (exclude variant terms from plot) ----
+model_results <- data.frame(
+  Variable = c("s_titer_geom_catQ1", "s_titer_geom_catQ2", "s_titer_geom_catQ3", "s_titer_geom_catQ4",
+               "transmission_intensity_biweek2Low", "transmission_intensity_biweek2High",
+               "vacc_dose_origZero", "vacc_dose_origOne", "vacc_dose_origTwo", "vacc_dose_origThree"),
+
+  Estimate = c(0, coef_values["s_titer_geom_catQ2"], coef_values["s_titer_geom_catQ3"], coef_values["s_titer_geom_catQ4"],
+               0, coef_values["transmission_intensity_biweek2High"],
+               0, coef_values["vacc_dose_origOne"], coef_values["vacc_dose_origTwo"], coef_values["vacc_dose_origThree"]),
+
+  Std_Error = c(0, std_errors["s_titer_geom_catQ2"], std_errors["s_titer_geom_catQ3"], std_errors["s_titer_geom_catQ4"],
+                0, std_errors["transmission_intensity_biweek2High"],
+                0, std_errors["vacc_dose_origOne"], std_errors["vacc_dose_origTwo"], std_errors["vacc_dose_origThree"])
+)
+
+
+# Convert estimates to ORs 
+model_results <- model_results %>%
+  mutate(
+    OR = exp(Estimate),
+    LowerCI = exp(Estimate - 1.96 * Std_Error),
+    UpperCI = exp(Estimate + 1.96 * Std_Error),
+    annotations = ifelse(OR == 1 & LowerCI == 1 & UpperCI == 1,
+                         "               Ref", sprintf("    %.2f [%.2f–%.2f]", OR, LowerCI, UpperCI))
+  )
+
+# Labels
+model_results$Variable <- factor(model_results$Variable,
+  levels = rev(c("s_titer_geom_catQ1", "s_titer_geom_catQ2", "s_titer_geom_catQ3", "s_titer_geom_catQ4",
+                 "transmission_intensity_biweek2Low", "transmission_intensity_biweek2High",
+                 "vacc_dose_origZero", "vacc_dose_origOne", "vacc_dose_origTwo", "vacc_dose_origThree")),
+  labels = rev(c("S Titer: Q1", "Q2", "Q3", "Q4",
+                 "Trans: Low", "High",
+                 "Vacc dose: 0", "1", "2", "3"))
+)
+
+
+# Assign colors
+model_results$Colors <- c(
+  rep("#377eb8", 4),   # Titer
+  rep("#984ea3", 2),   # Transmission
+  rep("#CC5500", 4)    # Vaccine dose
+)
+
+
+# Plot annotations
+annotation_x_position <- 11
+
+# ---- Step 3: Forest Plot ----
+fig2a <- ggplot(model_results, aes(y = Variable)) +
+  geom_point(aes(x = OR, color = Colors), size = 3, shape = 22) +
+  geom_errorbar(aes(xmin = LowerCI, xmax = UpperCI, color = Colors), width = 0.2) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "black") +
+  geom_text(aes(x = annotation_x_position, label = annotations), 
+            hjust = 0, size = 2.5, color = "black") +
+  scale_x_log10(labels = function(x) sprintf("%.1f", x), breaks = c(0.1, 0.5, 1, 5, 10)) +
+  scale_y_discrete(limits = levels(model_results$Variable)) +
+  scale_color_identity() +
+  theme_minimal(base_size = 9) +
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    axis.text.y = element_text(hjust = 1),
+    plot.title = element_text(size = 9, face = "bold"),
+    axis.title = element_text(size = 9),
+    axis.text = element_text(size = 8),
+    plot.margin = margin(t = 0.3, r = 0.3, b = 0.3, l = 0.3, unit = "cm")
+  ) +
+  labs(title = 'A. Odds ratios for testing PCR positive', x = "", y = NULL) +
+  coord_cartesian(xlim = c(0.1, 35))
+
+print(fig2a)
+
+```
+
+Plot 1B
+
+```{r}
+# Mean, SEM, and 95% CI
+data_summary <- data %>%
+  group_by(transmission_intensity_biweek2, pcr_pos) %>%
+  summarise(
+    mean_value = mean(s_titer_geom, na.rm = TRUE),
+    SEM = sd(s_titer_geom, na.rm = TRUE) / sqrt(n()),
+    lower = mean_value - qnorm(0.975) * SEM,
+    upper = mean_value + qnorm(0.975) * SEM,
+    .groups = 'drop'
+  )
+
+# Mean titer for negative samples for each combination of transmission and variant
+mean_titer_neg_data <- data %>% 
+  filter(pcr_pos == 1) %>% 
+  group_by(transmission_intensity_biweek2) %>% 
+  summarise(mean_titer_pos = mean(s_titer_geom, na.rm = TRUE))
+
+# Merge with data_summary
+data_summary <- merge(data_summary, mean_titer_neg_data, by ="transmission_intensity_biweek2", all.x = TRUE)
+
+# Adjust mean, lower, and upper by the mean titer for negatives for each combination
+data_summary$adjusted_mean <- ifelse(data_summary$pcr_pos == 1, 0, data_summary$mean_value - data_summary$mean_titer_pos)
+data_summary$adjusted_lower <- ifelse(data_summary$pcr_pos == 1, data_summary$lower - data_summary$mean_value, data_summary$lower - data_summary$mean_titer_pos)
+data_summary$adjusted_upper <- ifelse(data_summary$pcr_pos == 1, data_summary$upper - data_summary$mean_value, data_summary$upper - data_summary$mean_titer_pos)
+
+# Adjusted plot stratified by variant with Lancet-style
+fig2b <- ggplot() +
+  geom_point(data = data_summary, 
+             aes(x = transmission_intensity_biweek2, y = adjusted_mean, 
+                 color = factor(pcr_pos, labels = c("Pos", "Neg")),
+                 fill = factor(pcr_pos, labels = c("Pos", "Neg"))), 
+             position = position_dodge(0.4), size = 2, shape = 21, stroke = 0.5) +
+  geom_errorbar(data = data_summary, 
+                aes(x = transmission_intensity_biweek2, ymin = adjusted_lower, ymax = adjusted_upper, 
+                    color = factor(pcr_pos, labels = c("Pos", "Neg"))), 
+                position = position_dodge(0.4), width = 0.2) +
+  labs(x = "Transmission intensity", y = "Mean adjusted S-antibody titer",
+       fill = NULL, color = NULL, title = "B. Difference in titer by PCR result") +
+  scale_fill_manual(values = c("#377eb8", "#4daf4a"), labels = c("Pos", "Neg")) +
+  scale_color_manual(values = c("#377eb8", "#4daf4a"), labels = c("Pos", "Neg")) +
+  theme_light(base_size = 9)+
+  theme(axis.text.x = element_text(hjust = 0.5, size = 9),
+        axis.text.y = element_text(size = 9),
+        axis.title = element_text(size = 9),
+        plot.title = element_text(hjust = 0, size = 9, face = "bold"),
+        legend.title = element_blank(),
+        panel.grid.major.y = element_line(color = "grey90", size = 0.5),
+ #       panel.grid.minor = element_blank(),
+ #       panel.border = element_blank(),
+        panel.background = element_blank())+
+   theme(legend.position = c(1, 0.762),legend.justification = c(1, 0),  
+        legend.background = element_rect(fill = "white", color = "gray"), legend.text = element_text(size = 6),  legend.key.size = unit(0.3, "cm"))
+
+print(fig2b)
+
+
+
+```
+
+Plot 1C
+
+```{r}
+
+Gmean <- function(x) exp(mean(log(x[x > 0]), na.rm = TRUE))
+
+# Generate the 'All' data
+all_variant_data <- data
+all_variant_data$variant_period <- "Overall"
+
+# Append this 'All' data to the original dataset
+data_inc_all <- bind_rows(data, all_variant_data)%>%
+  mutate(variant_period = factor(variant_period, levels = c("Overall","Mu", "Delta", "BA.1", "BA.4/5"), ordered = TRUE))
+
+# Calculate the mean difference
+mean_diff <- data_inc_all %>%
+  group_by(transmission_intensity_biweek2, pcr_pos, variant_period) %>%
+  summarise(mean_value = Gmean(s_titer_nonlog), .groups = 'drop')
+
+mean_diff <- mean_diff %>%
+  spread(pcr_pos, mean_value) %>%
+  mutate(fold_diff = `0`/`1`) %>%
+  select(transmission_intensity_biweek2, fold_diff, variant_period)   # added variant_period to the selected columns
+
+# Calculate the mean titer
+overall_mean_titer <- data_inc_all %>%
+  group_by(variant_period) %>%
+  summarise(mean_titer = mean(s_titer_nonlog, na.rm = TRUE), .groups = 'drop')
+
+# Separate color values
+color_values <- c("blue", "red", "red", "green", "blue", "purple", "orange")
+
+fill_values <- c("blue", "red")
+
+# Convert NAs to a string "NA" for factor level
+data_inc_all <- data_inc_all %>%
+  mutate(
+    transmission_intensity_biweek2 = ifelse(is.na(transmission_intensity_biweek2), "NA", as.character(transmission_intensity_biweek2)),
+    transmission_intensity_biweek2 = factor(transmission_intensity_biweek2, levels = c("Low", "Med", "High", "NA")))
+
+
+fig2c <- ggplot(data_inc_all, aes(x = transmission_intensity_biweek2, y = s_titer_geom)) +
+  geom_boxplot(
+    aes(fill = factor(pcr_pos)),
+    alpha = 0.2,
+    position = position_dodge(width = 0.8), 
+    width = 0.6,  
+    outlier.shape = NA
+  ) +
+  labs(x = "Transmission Intensity", y = "  S-antibody titer", fill = "PCR") +
+  scale_fill_manual(values = c("#377eb8", "#e41a1c"), labels = c("Neg", "Pos")) + 
+  scale_color_manual(values = c("#377eb8", "#e41a1c"), labels = c("Neg", "Pos")) +
+  theme_light(base_size = 11) +
+  theme(
+    strip.background = element_blank(),
+    panel.spacing = unit(0.5, "lines"),
+    strip.text.x = element_text(size = 8, color = 'black'),
+    legend.position = "bottom", 
+    legend.key.size = unit(0.3, "cm"), 
+    legend.text = element_text(size = 6),  
+    legend.margin = margin(t = 0, unit = "cm"),
+    plot.margin = margin(t = 0.3, r = 0.3, b = 0.3, l = 0.3, unit = "cm")  
+  ) + 
+  geom_text(
+    data = mean_diff,
+    aes(x = transmission_intensity_biweek2, y = Inf, label = sprintf("x%.1f", fold_diff)),
+    vjust = 1.5, size = 2.5
+  ) +
+  labs(title = 'C. Antibody titer by variant, transmission intensity, and PCR result')+
+  facet_wrap(~ variant_period, scales = "free_x", nrow = 1)
+
+print(fig2c)
+
+# Participant counts
+
+
+# Function for GMT with 95% CI
+Gmean_CI <- function(x) {
+  x <- x[x > 0]
+  n <- length(x)
+  if (n == 0) return(c(GMT = NA, Lower = NA, Upper = NA))
+  m <- mean(log(x))
+  se <- sd(log(x)) / sqrt(n)
+  lower <- m - 1.96 * se
+  upper <- m + 1.96 * se
+  c(GMT = exp(m), Lower = exp(lower), Upper = exp(upper))
+}
+
+# Generate counts + GMT + CI
+participant_summary <- data_inc_all %>%
+  group_by(variant_period, transmission_intensity_biweek2, pcr_pos) %>%
+  summarise(
+    N = n(),
+    GMT_CI = list(Gmean_CI(s_titer_nonlog)),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    GMT = sapply(GMT_CI, function(x) x["GMT"]),
+    Lower = sapply(GMT_CI, function(x) x["Lower"]),
+    Upper = sapply(GMT_CI, function(x) x["Upper"]),
+    PCR_status = ifelse(pcr_pos == 0, "Neg", "Pos"),
+    GMT_CI_str = sprintf("%.1f (%.1f–%.1f)", GMT, Lower, Upper)
+  ) %>%
+  select(variant_period, transmission_intensity_biweek2, PCR_status, N, GMT_CI_str) %>%
+  arrange(variant_period, transmission_intensity_biweek2, PCR_status)
+
+# View the table
+print(participant_summary)
+
+
+```
+
+Plot 1D
+
+```{r}
+
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(patchwork)
+
+# Step 1: Separate positive and negative cases
+data_pos <- data %>% filter(pcr_pos == 1)
+data_neg <- data %>% filter(pcr_pos == 0)
+
+# Step 2: Create week groupings
+data_pos <- data_pos %>% mutate(week = floor_date(date, unit = "week"))
+data_neg <- data_neg %>% mutate(week = floor_date(date, unit = "week"))
+
+# Step 3: Average negative titers by week
+neg_week_avg <- data_neg %>%
+  group_by(week) %>%
+  summarise(mean_titer_neg = mean(s_titer_geom, na.rm = TRUE), .groups = "drop")
+
+# Step 4: Merge with positive cases
+data_pos <- data_pos %>%
+  left_join(neg_week_avg, by = "week") %>%
+  mutate(titer_diff = s_titer_geom - mean_titer_neg) %>%
+  filter(!is.na(titer_diff), !is.na(variant_period))
+
+# Step 5: Create overall data with new label
+data_pos_overall <- data_pos %>% mutate(variant_period = "Overall")
+
+# Combine with original variant-specific data
+combined_data <- bind_rows(data_pos_overall, data_pos)
+
+# Ensure variant_period is a factor with the desired order
+combined_data$variant_period <- factor(
+  combined_data$variant_period,
+  levels = c("Overall", "Mu", "Delta", "BA.1", "BA.4/5")
+)
+
+# Define Nature Medicine style base theme
+base_nm_theme <- theme_minimal(base_size = 9) +
+  theme(
+    strip.background = element_blank(),
+    strip.text.x = element_text(size = 9,  color = "black"),
+    panel.spacing = unit(0.6, "lines"),
+    legend.position = "bottom",  # Move legend to the bottom
+    legend.key.size = unit(0.4, "cm"),  # Make legend keys smaller
+    legend.text = element_text(size = 7),  # Make legend text smaller
+    legend.margin = margin(t = 0, unit = "cm"),  # Reduce space above the legend
+    axis.title = element_text(size = 9),
+    axis.text = element_text(size = 8),
+    plot.title = element_text(hjust = 0, size = 10, face = "bold"),
+    plot.margin = margin(t = 0.3, r = 0.3, b = 0.3, l = 0.3, unit = "cm"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.3)  # Thin black border
+  )
+
+# Define no-grid theme for forestplot only
+no_grid_theme <- base_nm_theme + theme(panel.grid = element_blank())
+
+
+# Step 6: Define fig2c
+fig2d <- ggplot(combined_data, aes(x = percent_positive, y = titer_diff)) +
+  # Density shading (rescaled to Y axis range)
+#  stat_density(data = combined_data,aes(x = percent_positive, y = after_stat(scaled) * max(combined_data$titer_diff, na.rm = TRUE) * 0.3),fill = "#003f5c",alpha = 0.1,inherit.aes = FALSE) +
+  # Main GAM smooth line
+  geom_smooth(method = "gam", formula = y ~ s(x, k = 3), se = TRUE, size = 0.6,
+              color = "#003f5c", fill = "#a6bddb") +
+  # Correlation stat
+  #stat_cor( method = "spearman",label.x.npc = "left", label.y.npc = "top", size = 2.8) +
+  # Facet by variant_period
+  facet_wrap(~variant_period, scales = "free_x", nrow = 1) +
+  labs(
+    title = "D. Titer differences between PCR positive and negative study participants, by transmission intensity and variant",
+    x = "Biweekly Percent PCR Positive",
+    y = "S-antibody difference (Pos - Neg)"
+  ) +
+  base_nm_theme
+
+# Apply themes accordingly
+fig2a <- fig2a + no_grid_theme
+fig2b <- fig2b
+fig2c <- fig2c + base_nm_theme
+fig2d <- fig2d + base_nm_theme
+
+# Combine rows
+top_row <- fig2a + fig2b + plot_layout(ncol = 2, widths = c(3.2, 1))
+middle_row <- fig2c + plot_layout(ncol = 1)
+bottom_row <- fig2d + plot_layout(ncol = 1)
+
+# Final combined figure
+Figure2_final <- top_row / middle_row / bottom_row + plot_layout(heights = c(1, 1, 1))
+
+# Print figure
+print(Figure2_final)
+
+```
+
+##Figure 2 Plots 2A+2B
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(minpack.lm)
+library(purrr)
+library(patchwork)
+library(ROSE)
+
+# --- Scaled logistic function ---
+scaled_logit_fn <- function(t, beta0, beta1, lambda) {
+  lambda / (1 + exp(beta0 * (t - beta1)))
+}
+
+# --- Fit model ---
+fit_scaled_logit <- function(df) {
+  tryCatch({
+    nlsLM(
+      pcr_pos ~ scaled_logit_fn(s_titer_geom, beta0, beta1, lambda),
+      data = df,
+      start = list(beta0 = 1.5, beta1 = 3, lambda = 0.5),
+      lower = c(-Inf, -Inf, 0),
+      upper = c(Inf, Inf, 1)
+    )
+  }, error = function(e) NULL)
+}
+
+# --- Bootstrap 95% CI ---
+bootstrap_scaled_logit <- function(df, n_boot = 200, titer_seq = seq(0.1, 6, 0.1)) {
+  boot_preds <- matrix(NA, nrow = n_boot, ncol = length(titer_seq))
+  for (i in 1:n_boot) {
+    boot_df <- df[sample(1:nrow(df), replace = TRUE), ]
+    fit <- fit_scaled_logit(boot_df)
+    if (!is.null(fit)) {
+      preds <- scaled_logit_fn(titer_seq,
+                               beta0 = coef(fit)["beta0"],
+                               beta1 = coef(fit)["beta1"],
+                               lambda = coef(fit)["lambda"])
+      boot_preds[i, ] <- preds / preds[1]
+    }
+  }
+  boot_ci <- apply(boot_preds, 2, function(x) quantile(x, probs = c(0.025, 0.975), na.rm = TRUE))
+  data.frame(
+    Titer = titer_seq,
+    CI_low = boot_ci[1, ],
+    CI_high = boot_ci[2, ]
+  )
+}
+
+generate_group_curve <- function(group_name, group_df) {
+  titer_seq <- seq(0.1, 6, 0.1)
+  fit <- fit_scaled_logit(group_df)
+  if (is.null(fit)) return(NULL)
+
+  preds <- scaled_logit_fn(titer_seq,
+                           beta0 = coef(fit)["beta0"],
+                           beta1 = coef(fit)["beta1"],
+                           lambda = coef(fit)["lambda"])
+  # NO normalization
+ preds <- preds / preds[1]  #<-- remove this
+
+  boot_ci <- bootstrap_scaled_logit(group_df, n_boot = 200, titer_seq = titer_seq)
+
+  data.frame(
+    Titer = titer_seq,
+    RelativeRisk = preds,
+    CI_low = boot_ci$CI_low,
+    CI_high = boot_ci$CI_high,
+    Transmission = group_name
+  )
+}
+
+# --- Rebalance using ROSE ---
+data_low <- data %>% filter(transmission_intensity_biweek2 == "Low")
+#data_med <- data %>% filter(transmission_intensity_biweek2 == "Med")
+data_high <- data %>% filter(transmission_intensity_biweek2 == "High")
+
+set.seed(123)
+# ROSE balancing with both under- and over-sampling to increase sample size by 1.5
+data_low_bal <- ovun.sample(pcr_pos ~ ., data = data_low, method = "both", N = 2 * nrow(data_low))$data
+#data_med_bal <- ovun.sample(pcr_pos ~ ., data = data_med, method = "both", N = 1.5 * nrow(data_med))$data
+data_high_bal <- ovun.sample(pcr_pos ~ ., data = data_high, method = "both", N = 2 * nrow(data_high))$data
+
+# --- ORIGINAL DATA CURVES ---
+predicted_orig <- bind_rows(
+  generate_group_curve("Low", data_low),
+#  generate_group_curve("Med", data_med),
+  generate_group_curve("High", data_high)
+)
+
+# Plot original data
+p1 <- ggplot(predicted_orig, aes(x = Titer, y = RelativeRisk, color = Transmission)) +
+  geom_line(size = 0.7) +
+  geom_ribbon(aes(ymin = CI_low, ymax = CI_high, fill = Transmission), alpha = 0.1, color = NA) +
+  labs(title = "A. Observed data", x =  "S-antibody titer (log10)", y = "Relative Risk") +
+  scale_color_manual(values = c("Low" = "#ff7f0e", "Med" = "lightgreen", "High" = "#1f77b4")) +
+  scale_fill_manual(values = c("Low" = "#ff7f0e", "Med" = "lightgreen", "High" = "#1f77b4")) +
+  theme_minimal(base_size = 9) +
+  coord_cartesian(xlim = c(0.1, 5), ylim = c(0, 1)) +
+  theme(legend.position = "top", panel.border = element_rect(color = "gray", fill = NA, size = 0.2))
+
+
+# --- BALANCED DATA CURVES ---
+predicted_bal <- bind_rows(
+  generate_group_curve("Low", data_low_bal),
+ # generate_group_curve("Med", data_med_bal),
+  generate_group_curve("High", data_high_bal)
+)
+
+# Compute titer density (ROSE-balanced)
+d_low_bal <- density(data_low_bal$s_titer_geom, from = 0.1, to = 5)
+#d_med_bal <- density(data_med_bal$s_titer_geom, from = 0.1, to = 5)
+d_high_bal <- density(data_high_bal$s_titer_geom, from = 0.1, to = 5)
+
+titer_density_df_bal <- bind_rows(
+  data.frame(Titer = d_low_bal$x, Density = d_low_bal$y / max(d_low_bal$y), Transmission = "Low"),
+#  data.frame(Titer = d_med_bal$x, Density = d_med_bal$y / max(d_med_bal$y), Transmission = "Med"),
+  data.frame(Titer = d_high_bal$x, Density = d_high_bal$y / max(d_high_bal$y), Transmission = "High")
+)
+
+# Plot ROSe balanced data
+p2 <- ggplot(predicted_bal, aes(x = Titer, y = RelativeRisk, color = Transmission)) +
+  geom_line(size = 0.7) +
+  geom_ribbon(aes(ymin = CI_low, ymax = CI_high, fill = Transmission), alpha = 0.1, color = NA) +
+  labs(title = "B. Balanced data", x = "S-antibody titer (log10)", y = NULL) +
+  scale_color_manual(values = c("Low" = "#ff7f0e", "Med" = "lightgreen", "High" = "#1f77b4")) +
+  scale_fill_manual(values = c("Low" = "#ff7f0e", "Med" = "lightgreen", "High" = "#1f77b4")) +
+  theme_minimal(base_size = 9) +
+  coord_cartesian(xlim = c(0.1, 5), ylim = c(0, 1)) +
+    theme(legend.position = "top", panel.border = element_rect(color = "gray", fill = NA, size = 0.2))
+
+
+p1_mod <- p1 + base_nm_theme +
+  theme(legend.position = "bottom")
+
+p2_mod <- p2 + base_nm_theme + 
+  theme(legend.position = "bottom")
+
+final_plot <- p1_mod + p2_mod +
+  plot_layout(ncol = 2, guides = "collect") &
+  theme(legend.position = "bottom")
+
+print(final_plot)
+
+```
+
+Model metrics
+
+```{r}
+# Function to assess model fit
+assess_model_fit <- function(fit, data_used, group_name) {
+  if (is.null(fit)) {
+    return(data.frame(
+      Transmission = group_name,
+      N = nrow(data_used),
+      AIC = NA, RSS = NA, R2 = NA,
+      beta0 = NA, beta1 = NA, lambda = NA,
+      beta0_se = NA, beta1_se = NA, lambda_se = NA
+    ))
+  }
+
+  rss <- sum(resid(fit)^2)
+  tss <- sum((data_used$pcr_pos - mean(data_used$pcr_pos))^2)
+  r2 <- 1 - rss / tss
+  s <- summary(fit)
+
+  data.frame(
+    Transmission = group_name,
+    N = nrow(data_used),
+    AIC = AIC(fit),
+    RSS = rss,
+    R2 = r2,
+    beta0 = coef(fit)["beta0"],
+    beta1 = coef(fit)["beta1"],
+    lambda = coef(fit)["lambda"],
+    beta0_se = s$coefficients["beta0", "Std. Error"],
+    beta1_se = s$coefficients["beta1", "Std. Error"],
+    lambda_se = s$coefficients["lambda", "Std. Error"]
+  )
+}
+
+# Fit models
+fit_low_orig <- fit_scaled_logit(data_low)
+fit_high_orig <- fit_scaled_logit(data_high)
+fit_med_orig <- fit_scaled_logit(data_med)
+fit_low_bal <- fit_scaled_logit(data_low_bal)
+fit_med_bal <- fit_scaled_logit(data_med_bal)
+fit_high_bal <- fit_scaled_logit(data_high_bal)
+
+# Assess metrics
+model_diagnostics <- bind_rows(
+  assess_model_fit(fit_low_orig, data_low, "Low (Original)"),
+  assess_model_fit(fit_high_orig, data_high, "High (Original)"),
+  assess_model_fit(fit_low_bal, data_low_bal, "Low (Balanced)"),
+  assess_model_fit(fit_high_bal, data_high_bal, "High (Balanced)")
+)
+
+# View the table
+print(model_diagnostics)
+
+
+```
+
+## Figure 3
+
+```{r}
+
+library(truncnorm)
+library(ggplot2)
+library(dplyr)
+library(minpack.lm)
+library(patchwork)
+
+# Parameters
+set.seed(345)
+N <- 5000
+days <- 14
+low_exposure_rate <- 0.05
+high_exposure_rate <- 0.4
+
+# Define antibody distributions
+simulate_titers <- function(type = "unimodal") {
+  if (type == "unimodal") {
+    rtruncnorm(N, a = 0, mean = 2.5, sd = 0.8)
+  } else if (type == "bimodal") {
+    c(
+      rtruncnorm(N %/% 2, a = 0, mean = 1.5, sd = 0.4),
+      rtruncnorm(N - N %/% 2, a = 0, mean = 4.5, sd = 0.6)
+    )
+  } else if (type == "trimodal") {
+    seg <- N %/% 3
+    c(
+      rtruncnorm(seg, a = 0, mean = 1.2, sd = 0.3),
+      rtruncnorm(seg, a = 0, mean = 3.0, sd = 0.4),
+      rtruncnorm(N - 2 * seg, a = 0, mean = 4.5, sd = 0.3)
+    )
+  } else if (type == "seronegative_majority") {
+    c(
+      rtruncnorm(round(N * 0.8), a = 0, mean = 0.6, sd = 0.1),
+      rtruncnorm(N - round(N * 0.8), a = 0, mean = 3.0, sd = 0.7)
+    )
+  } else {
+    stop("Unknown distribution type")
+  }
+}
+
+# Infection risk function
+# Edited to give a smoother function
+infection_risk_per_exposure <- function(t) {
+  1 / (1 + exp(1.5 * (t - 3)))
+}
+
+# Scaled logit risk function from Middleton et al
+# Simple function for exposure = 0 or 1
+scaled_logit_fn <- function(t, beta0, beta1, lambda) {
+  lambda / (1 + exp(beta0 *(t - beta1)))
+}
+
+# Model with repeat exposures
+# (Not identifiable)
+infection_risk_given_titer <- function(t, exposures, beta0, beta1, lambda) {
+  per_exposure_risk <- scaled_logit_fn(t, beta0, beta1, lambda)
+  1 - (1 - per_exposure_risk)^exposures
+}
+
+
+# Simulation and plotting function for titer-based distributions
+simulate_plot <- function(dist_type) {
+  
+  titer <- simulate_titers(dist_type)
+  per_exposure_risk <- infection_risk_per_exposure(titer)
+  per_exposure_risk0 <- infection_risk_per_exposure(0)
+  
+  exposures_low <- rpois(N, lambda = low_exposure_rate * days)
+  exposures_high <- rpois(N, lambda = high_exposure_rate * days)
+  infection_prob_low <- 1 - (1 - per_exposure_risk)^exposures_low
+  infection_prob_high <- 1 - (1 - per_exposure_risk)^exposures_high
+  infected_low <- rbinom(N, size = 1, prob = infection_prob_low)
+  infected_high <- rbinom(N, size = 1, prob = infection_prob_high)
+
+  # Infection risk vs titres
+  df <- data.frame(
+    Titer = rep(titer, 2),
+    Infection = c(infected_low, infected_high),
+    Transmission = rep(c("Low", "High"), each = N)
+  ) %>% filter(Titer <= 5)
+
+  
+  titer_density <- density(df$Titer, from = 0.1, to = 5)
+  titer_density_df <- data.frame(
+    Titer = titer_density$x,
+    Density = titer_density$y / max(titer_density$y)
+  )
+  
+  # Create a data.frame for 'true' risk given exposure, relative to zero titer
+  titer_seq <- seq(0,5,0.1)
+  df_risk_line <- data.frame(Titer = titer_seq, rel_exposure_risk = 
+                               infection_risk_per_exposure(titer_seq)/per_exposure_risk0)
+
+  # Fit scaled logit model per Transmission group
+  df_pred <- df %>%
+    group_by(Transmission) %>%
+    do({
+      group_df <- .
+      
+      # Starting parameter guesses
+      start_vals <- list(beta0 = 1.5, beta1 = 3, lambda = 0.5)
+      
+      # Fit the scaled logit model
+      fit <- tryCatch({
+        nlsLM(Infection ~ scaled_logit_fn(t = Titer, beta0, beta1, lambda),
+              data = group_df,
+              start = start_vals,
+              lower = c(-Inf, -Inf, 0),
+              upper = c(Inf, Inf, 1))
+      }, error = function(e) return(NULL))
+      
+      # If fitting fails, return empty data frame
+      if (is.null(fit)) return(data.frame())
+      
+      # Create prediction range
+      titer_seq <- seq(min(group_df$Titer), max(group_df$Titer), length.out = 200)
+      predicted <- scaled_logit_fn(titer_seq,
+                                   beta0 = coef(fit)["beta0"],
+                                   beta1 = coef(fit)["beta1"],
+                                   lambda = coef(fit)["lambda"])
+      
+      # Build output data
+      data.frame(
+        Titer = titer_seq,
+        RelativeRisk = predicted/predicted[1],
+        Transmission = unique(group_df$Transmission)
+      )
+    }) %>%
+    ungroup()
+  
+  ggplot(df_pred, aes(x = Titer, y = RelativeRisk, color = Transmission)) +
+    geom_area(data = titer_density_df, aes(x = Titer, y = Density), inherit.aes = FALSE,
+              fill = "lightgray", alpha = 0.4) +
+    geom_line(size = 0.9) +
+    geom_line(data = df_risk_line, aes(x = Titer, y = rel_exposure_risk), 
+              color = "black", size = 1, linetype = "dotted", inherit.aes = FALSE) +
+    scale_color_manual(values = c("Low" = "#ff7f0e", "High" = "#1f77b4")) +
+    scale_fill_manual(values = c("Low" = "#ff7f0e", "High" = "#1f77b4")) +
+    labs(x = "Anti-Spike Antibody Titer", y = "Probability of Infection") +
+    coord_cartesian(xlim = c(0, 5), ylim = c(0, 1)) +
+    theme_light(base_size = 10) +
+    theme(
+      axis.text.x = element_text(hjust = 0.5, size = 9),
+      axis.text.y = element_text(size = 9),
+      axis.title = element_text(size = 9),
+      panel.grid.major.y = element_line(color = "grey90", size = 0.5),
+      panel.background = element_blank(),
+      legend.position = c(0.98, 0.5),
+      legend.justification = c(1, 0),
+      legend.background = element_rect(fill = "white", color = "gray"),
+      legend.text = element_text(size = 8),
+      legend.key.size = unit(0.5, "cm")
+    ) +
+    guides(fill = guide_none(), color = guide_legend(title = "Transmission intensity"))
+  
+}
+
+# Generate individual plots
+g1 <- simulate_plot("unimodal") +
+  base_nm_theme +
+  labs(x = NULL) +  # Remove x-axis title for top left
+  theme(plot.tag.position = "topleft", legend.position = "bottom")
+
+g2 <- simulate_plot("bimodal") +
+  base_nm_theme +
+  labs(x = NULL, y = NULL) +  # Remove x-axis and y-axis title for top right
+  theme(plot.tag.position = "topleft", legend.position = "bottom")
+
+g3 <- simulate_plot("trimodal") +
+  base_nm_theme +
+  theme(plot.tag.position = "topleft", legend.position = "bottom")
+
+g4 <- simulate_plot("seronegative_majority") +
+  base_nm_theme +
+  labs(y = NULL) +  # Remove y-axis title for bottom right
+  theme(plot.tag.position = "topleft", legend.position = "bottom")
+
+# Combine into 2x2 layout
+total_combined <- (g1 + g2 + g3 + g4) +
+  plot_layout(ncol = 2, guides = "collect") +
+  plot_annotation(
+    tag_levels = 'A',
+    tag_prefix = "",
+    tag_suffix = ".",
+    theme = theme(plot.tag = element_text(face = "bold", size = 12))
+  ) &
+  theme(legend.position = "bottom")
+
+# Show
+print(total_combined)
+
+```
+
+##Figure 4
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# grid over VE and Exposures for each p_base
+grid <- expand.grid(
+  VE = seq(0, 1, by = 0.001),         # finer step prevents any stair-steps
+  Exposures = c(1, 3, 7, 14),
+  p_base = c(0.05, 0.1, 0.2, 0.3, 0.5, 1)
+)
+
+# deterministic infection probability
+det_all <- grid %>%
+  mutate(
+    p_eff = (1 - VE) * p_base,
+    mean  = 1 - (1 - p_eff)^Exposures
+  ) %>%
+  # optional: binomial 95% CI around mean for cohort size N
+  mutate(
+    se   = sqrt(pmax(mean * (1 - mean) / N, 0)),
+    lwr  = pmax(0, mean - 1.96 * se),
+    upr  = pmin(1, mean + 1.96 * se)
+  )
+
+# plot: no loess, just lines; ribbons as horizontal CIs in x (like your original)
+veff_plot <- ggplot(det_all,
+  aes(x = mean, y = VE * 100, group = factor(Exposures),
+      color = factor(Exposures), fill = factor(Exposures))) +
+  geom_ribbon(aes(xmin = lwr, xmax = upr), alpha = 0.2, color = NA) +
+  geom_line(linewidth = 0.6) +
+  facet_wrap(~p_base, ncol = 2,
+             labeller = label_bquote("Infection risk per exposure" == .(p_base))) +
+  scale_color_manual(values = c("1"="#999999","3"="#E69F00","7"="#56B4E9","14"="#009E73")) +
+  scale_fill_manual(values  = c("1"="#999999","3"="#E69F00","7"="#56B4E9","14"="#009E73")) +
+  labs(x = "Cumulative Probability of Infection",
+       y = "Vaccine Efficacy Per Exposure Event (%)",
+       color = "Exposures", fill = "Exposures") +
+  coord_cartesian(xlim = c(0, 1)) +
+  theme_light(base_size = 10) +
+  theme(
+    axis.text = element_text(size = 11),
+    axis.title = element_text(size = 11),
+    strip.text = element_text(size = 11, face = "bold"),
+    legend.position = "right",
+    panel.grid.major.y = element_line(color = "grey90", linewidth = 0.5),
+    panel.background = element_blank()
+  )
+
+# Display the plot
+print(veff_plot)
+
+
+```
+
+# 04_figures_tables_supplement.R
+
+## Table S1
+
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(forcats)
+})
+
+# Variables to summarize (must exist in `data`)
+variables <- c("gender", "age_cat", "setting", "province", "vacc_dose_orig",
+               "variant_period", "transmission_intensity_biweek2")
+
+make_block <- function(var_name, df = data) {
+  # Pull column by name, keep factor order if present, and make missing explicit
+  var_vec <- df[[var_name]]
+  if (is.factor(var_vec)) {
+    var_fac <- fct_explicit_na(var_vec, na_level = "Missing")
+  } else {
+    var_fac <- fct_explicit_na(as.factor(var_vec), na_level = "Missing")
+  }
+
+  # Build counts for pcr_pos ∈ {0,1}, include zeros for empty cells
+  block <- df %>%
+    mutate(.var = var_fac) %>%
+    count(.var, pcr_pos, name = "N") %>%
+    complete(.var, pcr_pos = 0:1, fill = list(N = 0)) %>%
+    group_by(.var) %>%
+    summarise(
+      `Positive (N)` = sum(N[pcr_pos == 1], na.rm = TRUE),
+      `Negative (N)` = sum(N[pcr_pos == 0], na.rm = TRUE),
+      Total          = sum(N, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      `Positive (%)` = round(100 * (`Positive (N)` / Total), 1),
+      `Negative (%)` = round(100 * (`Negative (N)` / Total), 1),
+      `Total (%)`    = round(100 * (Total / sum(Total)), 1)  # % within this variable’s block
+    ) %>%
+    mutate(
+      `Positive (N%)` = paste0(`Positive (N)`, " (", `Positive (%)`, "%)"),
+      `Negative (N%)` = paste0(`Negative (N)`, " (", `Negative (%)`, "%)"),
+      `Total (N%)`    = paste0(Total, " (", `Total (%)`, "%)")
+    ) %>%
+    transmute(
+      Variable = var_name,
+      Category = as.character(.var),
+      `Positive (N%)`, `Negative (N%)`, `Total (N%)`
+    )
+
+  # Put the variable name only on the first row of the block (pretty print)
+  block %>%
+    mutate(Variable = ifelse(row_number() == 1, Variable, ""))
+}
+
+final_summary <- bind_rows(lapply(variables, make_block))
+
+# Preview
+print(final_summary, n = nrow(final_summary))
+
+```
+
+##Figure S2 Plot S2A
+
+```{r}
+# Convert to an unordered factor first
+data$variant_period <- factor(data$variant_period, 
+                              levels = c("Mu", "Delta", "BA.1", "BA.4/5"), 
+                              ordered = FALSE)  # This removes the "ordered" attribute
+
+# Now set "Mu" as the reference level
+data$variant_period <- relevel(data$variant_period, ref = "Mu")
+
+
+data$dpv_vacc_interaction <- as.numeric(data$dpv_vacc_interaction)
+
+# Creating the categorical variable based on quantiles for s_titer_geom
+data$s_titer_geom_cat <- cut(data$s_titer_geom, 
+                                           breaks = quantile(data$s_titer_geom, probs = 0:4/4, na.rm = TRUE),
+                                           labels = c("Q1", "Q2", "Q3", "Q4"),
+                                           include.lowest = TRUE)
+
+# Filter out the undesired dose
+data_model_overall <- data %>%
+  filter(vacc_dose != '4')
+
+# Updating the model formula to use the categorical variable instead of the continuous one
+overall_model_gam <- mgcv::gam(pcr_pos ~ s(age) + vacc_dose_orig + s(dpv_vacc_interaction_numeric) + variant_period + s_titer_geom_cat + transmission_intensity_biweek2, 
+                               data = data_model_overall, 
+                               family = "binomial")
+
+# ---- Step 1: Extract Model Estimates ----
+model_summary <- summary(overall_model_gam)
+
+# Extract estimates & standard errors
+coef_values <- model_summary$p.table[, 1]  # Estimates
+std_errors <- model_summary$p.table[, 2]   # Standard Errors
+
+# ---- Step 2 (robust): build results safely ----
+get_coef <- function(nm) if (!is.null(coef_values) && nm %in% names(coef_values)) coef_values[[nm]] else NA_real_
+get_se   <- function(nm) if (!is.null(std_errors)  && nm %in% names(std_errors))  std_errors[[nm]]  else NA_real_
+
+model_results <- tibble::tibble(
+  Variable = c("s_titer_geom_catQ1","s_titer_geom_catQ2","s_titer_geom_catQ3","s_titer_geom_catQ4",
+               "transmission_intensity_biweek2Low","transmission_intensity_biweek2High",
+               "vacc_dose_origZero","vacc_dose_origOne","vacc_dose_origTwo","vacc_dose_origThree"),
+  Estimate  = c(0, get_coef("s_titer_geom_catQ2"), get_coef("s_titer_geom_catQ3"), get_coef("s_titer_geom_catQ4"),
+                0, get_coef("transmission_intensity_biweek2High"),
+                0, get_coef("vacc_dose_origOne"), get_coef("vacc_dose_origTwo"), get_coef("vacc_dose_origThree")),
+  Std_Error = c(0, get_se("s_titer_geom_catQ2"), get_se("s_titer_geom_catQ3"), get_se("s_titer_geom_catQ4"),
+                0, get_se("transmission_intensity_biweek2High"),
+                0, get_se("vacc_dose_origOne"), get_se("vacc_dose_origTwo"), get_se("vacc_dose_origThree"))
+) %>%
+  # Convert to OR and CIs
+  dplyr::mutate(
+    OR      = exp(Estimate),
+    LowerCI = exp(Estimate - 1.96 * Std_Error),
+    UpperCI = exp(Estimate + 1.96 * Std_Error)
+  ) %>%
+  # Label variables for plotting
+  dplyr::mutate(
+    Variable = factor(
+      Variable,
+      levels = rev(c("s_titer_geom_catQ1","s_titer_geom_catQ2","s_titer_geom_catQ3","s_titer_geom_catQ4",
+                     "transmission_intensity_biweek2Low","transmission_intensity_biweek2High",
+                     "vacc_dose_origZero","vacc_dose_origOne","vacc_dose_origTwo","vacc_dose_origThree")),
+      labels = rev(c("S Titer: Q1","Q2","Q3","Q4",
+                     "Trans: Low","High",
+                     "Vacc dose: 0","1","2","3"))
+    ),
+    annotations = dplyr::if_else(
+      is.finite(OR) & is.finite(LowerCI) & is.finite(UpperCI),
+      sprintf("    %.2f [%.2f–%.2f]", OR, LowerCI, UpperCI),
+      "               Ref"
+    ),
+    # Assign group colors row-by-row
+    Colors = dplyr::case_when(
+      grepl("^S Titer", as.character(Variable))   ~ "#377eb8",
+      grepl("^Trans",   as.character(Variable))   ~ "#984ea3",
+      grepl("^Vacc dose",as.character(Variable))  ~ "#CC5500",
+      TRUE                                        ~ "#444444"
+    )
+  ) %>%
+  # Drop rows with missing estimates (non-baseline rows that weren’t estimated)
+  dplyr::filter(!is.na(Estimate) | grepl("(Q1$|Low$|0$)", as.character(Variable)))
+
+# ---- Step 3: Forest Plot (dynamic limits so nothing gets clipped) ----
+x_max <- max(model_results$UpperCI[is.finite(model_results$UpperCI)], na.rm = TRUE)
+annotation_x_position <- x_max * 1.15
+x_upper <- max(35, annotation_x_position * 1.05)  # keep your 35 if smaller
+
+forestplot_combined2 <- ggplot(model_results, aes(y = Variable)) +
+  geom_point(aes(x = OR, color = Colors), size = 3, shape = 22, na.rm = TRUE) +
+  geom_errorbar(aes(xmin = LowerCI, xmax = UpperCI, color = Colors), width = 0.2, na.rm = TRUE) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "black") +
+  geom_text(aes(x = annotation_x_position, label = annotations),
+            hjust = 0, size = 2.5, color = "black", na.rm = TRUE) +
+  scale_x_log10(labels = function(x) sprintf("%.1f", x), breaks = c(0.1, 0.5, 1, 5, 10)) +
+  scale_y_discrete(limits = levels(model_results$Variable)) +
+  scale_color_identity() +
+  theme_minimal(base_size = 9) +
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    axis.text.y = element_text(hjust = 1),
+    plot.title = element_text(size = 9, face = "bold"),
+    axis.title = element_text(size = 9),
+    axis.text = element_text(size = 8),
+    plot.margin = margin(t = 0.3, r = 0.3, b = 0.3, l = 0.3, unit = "cm")
+  ) +
+  labs(title = "A. Odds ratios for testing PCR positive (S-antibody included)", x = "", y = NULL) +
+  coord_cartesian(xlim = c(0.1, x_upper))
+
+print(forestplot_combined2)
+
+
+
+
+```
+
+Plot S2B
+
+```{r}
+# --- Prepare model output (again) ---
+library(mgcv)
+library(dplyr)
+library(ggplot2)
+library(tibble)
+
+# --- Refit model excluding S-antibody titer variable ---
+overall_model_gam_no_titer <- mgcv::gam(
+  pcr_pos ~ s(age) + vacc_dose_orig + s(dpv_vacc_interaction_numeric) + variant_period +  transmission_intensity_biweek2,
+  data = data_model_overall, 
+  family = "binomial"
+)
+
+# --- Extract parametric terms ---
+parametric_table_no_titer <- summary(overall_model_gam_no_titer)$p.table
+
+# --- Create dataframe ---
+results_df_no_titer <- as.data.frame(parametric_table_no_titer) %>%
+  rownames_to_column(var = "Term") %>%
+  mutate(
+    OR = exp(Estimate),
+    LowerCI = exp(Estimate - 1.96 * `Std. Error`),
+    UpperCI = exp(Estimate + 1.96 * `Std. Error`)
+  ) %>%
+  rename(StdError = `Std. Error`, PValue = `Pr(>|z|)`)
+
+# --- Filter to desired terms ---
+results_df_no_titer <- results_df_no_titer %>%
+  filter(grepl("transmission_intensity_biweek2|vacc_dose_orig", Term))
+
+# --- Manually add reference rows ---
+ref_rows_no_titer <- tibble(
+  Term = c("transmission_intensity_biweek2Low", "vacc_dose_origZero"),
+  Estimate = 0,
+  StdError = 0,
+  PValue = 1,
+  OR = 1,
+  LowerCI = 1,
+  UpperCI = 1
+)
+
+results_df_no_titer <- bind_rows(ref_rows_no_titer, results_df_no_titer)
+
+# --- Label mapping ---
+label_map_no_titer <- c(
+  "transmission_intensity_biweek2Low" = "Trans: Low",
+  "transmission_intensity_biweek2High" = "High",
+  "vacc_dose_origZero" = "Vacc dose: 0",
+  "vacc_dose_origOne" = "1",
+  "vacc_dose_origTwo" = "2",
+  "vacc_dose_origThree" = "3"
+)
+
+group_map_no_titer <- c(
+  "transmission_intensity_biweek2Low" = "Transmission",
+  "transmission_intensity_biweek2High" = "Transmission",
+  "vacc_dose_origZero" = "Vaccination",
+  "vacc_dose_origOne" = "Vaccination",
+  "vacc_dose_origTwo" = "Vaccination",
+  "vacc_dose_origThree" = "Vaccination"
+)
+
+# --- Update ---
+results_df_no_titer <- results_df_no_titer %>%
+  filter(Term %in% names(label_map_no_titer)) %>%
+  mutate(
+    Variable = factor(label_map_no_titer[Term], levels = rev(unname(label_map_no_titer))),
+    Group = group_map_no_titer[Term]
+  )
+
+# --- Assign Colors ---
+results_df_no_titer$Colors <- case_when(
+  results_df_no_titer$Group == "Transmission" ~ "#984ea3",
+  results_df_no_titer$Group == "Vaccination" ~ "#CC5500",
+  TRUE ~ "black"
+)
+
+# --- Annotations ---
+results_df_no_titer <- results_df_no_titer %>%
+  mutate(annotations = ifelse(
+    OR == 1 & LowerCI == 1 & UpperCI == 1,
+    "         Ref",
+    sprintf("%.2f [%.2f–%.2f]", OR, LowerCI, UpperCI)
+  ))
+
+
+# --- Plot ---
+max_upper_ci_no_titer <- max(results_df_no_titer$UpperCI, na.rm = TRUE)
+annotation_x_position_no_titer <- max_upper_ci_no_titer * 1.3
+
+forestplot_no_titer <- ggplot(results_df_no_titer, aes(y = Variable)) +
+  geom_point(aes(x = OR, color = Colors), size = 3, shape = 22, na.rm = TRUE) +
+  geom_errorbar(aes(xmin = LowerCI, xmax = UpperCI, color = Colors), width = 0.2, na.rm = TRUE) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "black") +
+  geom_text(aes(x = annotation_x_position_no_titer, label = annotations), hjust = 0, size = 2.7, color = "black") +
+  scale_x_log10(labels = function(x) sprintf("%.1f", x), breaks = c(0.1, 0.5, 1, 5, 10)) +
+  scale_y_discrete(limits = levels(results_df_no_titer$Variable)) +
+  scale_color_identity() +
+  theme_minimal(base_size = 9) +
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    axis.text.y = element_text(hjust = 1),
+    plot.title = element_text(size = 9, face = "bold"),
+    axis.title = element_text(size = 9),
+    axis.text = element_text(size = 8),
+    plot.margin = margin(t = 0.3, r = 0.3, b = 0.3, l = 0.3, unit = "cm")
+  ) +
+  labs(title = "B. Odds ratios for testing PCR positive (S-antibody excluded)", x = "", y = NULL) +
+  expand_limits(x = c(0.01, annotation_x_position_no_titer * 1.5)) +
+  coord_cartesian(xlim = c(0.1, 35))
+
+print(forestplot_no_titer)
+
+
+```
+
+##Figure S3
+
+```{r}
+# ---- Boxplots: 5 sub-plots; each shows Low vs High ----
+library(ggplot2)
+library(dplyr)
+
+# Colors (lightened tints to match your ridge figure style)
+col_high  <- "#6baed6"  # lighter blue
+col_low <- "#fb6a4a"  # lighter red
+
+
+base_df <- data %>%
+  filter(transmission_intensity_biweek2 %in% c("Low","High"),
+         !is.na(s_titer_geom),
+         !is.na(variant_period)) %>%
+  mutate(
+    # short labels for plotting
+    trans_simple = factor(transmission_intensity_biweek2, levels = c("Low","High"),
+                          labels = c("Low", "High"))
+  )
+
+overall_df <- base_df %>%
+  mutate(variant_period = "Overall")
+
+plot_df_box <- bind_rows(base_df, overall_df) %>%
+  mutate(
+    variant_period = factor(variant_period,
+                            levels = c("Mu","Delta","BA.1","BA.4/5","Overall"))
+  )
+
+# Optional: define pretty x tick labels with cutoff reminder
+x_lab_short <- c("Low", "High")
+
+p_box5 <- ggplot(plot_df_box,
+                 aes(x = trans_simple, y = s_titer_geom, fill = trans_simple)) +
+  geom_boxplot(width = 0.55, outlier.shape = NA, alpha = 0.9,
+               color = "black", linewidth = 0.3) +
+  # (Optional) faint jitter to hint at spread; comment out to omit
+  geom_jitter(width = 0.10, height = 0, size = 0.3, alpha = 0.12,
+              color = "grey30", show.legend = FALSE) +
+  facet_wrap(~ variant_period, nrow = 1, scales = "fixed") +
+  scale_fill_manual(values = c("Low" = col_low, "High" = col_high)) +
+  guides(fill = "none") +
+  scale_x_discrete(labels = x_lab_short) +
+  labs(
+    title = NULL,
+    x = "Transmission intensity",
+    y = "Anti-spike antibody titer (log10 BAU/mL)"
+  ) +
+  theme_classic(base_size = 9, base_family = "Helvetica") +
+  theme(
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    axis.title.y     = element_text(size = 9, margin = margin(r = 6)),
+    axis.text.y      = element_text(size = 8),
+    axis.ticks.length = unit(2, "pt"),
+    axis.ticks       = element_line(linewidth = 0.3),
+    strip.background = element_rect(fill = "white", color = NA),
+    strip.text       = element_text(size = 8, face = "bold", margin = margin(b = 4)),
+    panel.spacing    = unit(6, "pt"),
+    plot.margin      = margin(4, 6, 4, 6)
+  )
+
+# ---- counts per box ----
+n_df <- plot_df_box %>%
+  group_by(variant_period, trans_simple) %>%
+  summarise(n = dplyr::n(), .groups = "drop")
+
+# ---- one common y for all facets ----
+y_top <- max(plot_df_box$s_titer_geom, na.rm = TRUE) * 1.06   # small headroom
+
+# Put labels at identical y across panels
+n_top <- n_df %>% mutate(y = y_top)
+
+# (optional) give a bit more top space so labels don't clip
+p_box5 <- p_box5 +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.05))) +
+  geom_text(
+    data = n_top,
+    aes(x = trans_simple, y = y, label = paste0("n=", n)),
+    size = 2.4, vjust = 0
+  )
+
+```
+
+##Figure S4
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(minpack.lm)
+library(purrr)
+
+# --- Logistic function ---
+scaled_logit_fn <- function(t, beta0, beta1, lambda) {
+  lambda / (1 + exp(beta0 * (t - beta1)))
+}
+
+# --- Fit model ---
+fit_scaled_logit <- function(df) {
+  tryCatch({
+    nlsLM(
+      pcr_pos ~ scaled_logit_fn(s_titer_geom, beta0, beta1, lambda),
+      data = df,
+      start = list(beta0 = 1, beta1 = 2.5, lambda = 0.6),
+      lower = c(-10, -10, 0),
+      upper = c(10, 10, 1),
+      control = nls.lm.control(maxiter = 200)
+    )
+  }, error = function(e) NULL)
+}
+
+# --- Bootstrap 95% CI ---
+bootstrap_scaled_logit <- function(df, n_boot = 200, titer_seq = seq(0.1, 6, 0.1)) {
+  boot_preds <- matrix(NA, nrow = n_boot, ncol = length(titer_seq))
+
+  for (i in 1:n_boot) {
+    boot_df <- df[sample(1:nrow(df), replace = TRUE), ]
+    fit <- fit_scaled_logit(boot_df)
+    if (!is.null(fit)) {
+      preds <- scaled_logit_fn(titer_seq,
+                               beta0 = coef(fit)["beta0"],
+                               beta1 = coef(fit)["beta1"],
+                               lambda = coef(fit)["lambda"])
+      boot_preds[i, ] <- preds / preds[1]
+    }
+  }
+
+  boot_ci <- apply(boot_preds, 2, function(x) quantile(x, probs = c(0.025, 0.975), na.rm = TRUE))
+
+  data.frame(
+    Titer = titer_seq,
+    CI_low = boot_ci[1, ],
+    CI_high = boot_ci[2, ]
+  )
+}
+
+# --- Generate curves per group and cutoff ---
+generate_group_curve <- function(group_name, group_df, cutoff_label) {
+  if (nrow(group_df) < 30) return(NULL)
+  if (length(unique(group_df$pcr_pos)) < 2) return(NULL)
+  if (sum(group_df$pcr_pos == 1) < 5 || sum(group_df$pcr_pos == 0) < 5) return(NULL)
+
+  titer_seq <- seq(0.1, 6, 0.1)
+  fit <- fit_scaled_logit(group_df)
+  if (is.null(fit)) return(NULL)
+
+  preds <- scaled_logit_fn(titer_seq,
+                           beta0 = coef(fit)["beta0"],
+                           beta1 = coef(fit)["beta1"],
+                           lambda = coef(fit)["lambda"])
+  preds <- preds / max(preds, na.rm = TRUE)
+
+  boot_ci <- bootstrap_scaled_logit(group_df, titer_seq = titer_seq)
+  boot_ci_norm <- boot_ci
+  boot_ci_norm$CI_low <- boot_ci$CI_low / max(preds, na.rm = TRUE)
+  boot_ci_norm$CI_high <- boot_ci$CI_high / max(preds, na.rm = TRUE)
+
+  data.frame(
+    Titer = titer_seq,
+    RelativeRisk = preds,
+    CI_low = boot_ci_norm$CI_low,
+    CI_high = boot_ci_norm$CI_high,
+    Transmission = group_name,
+    Cutoff = cutoff_label
+  )
+}
+
+# --- Cutoffs to test ---
+cutoffs <- c(12.5, 15, 17.5, 20, 22.5, 25)
+
+# --- Apply to original data ---
+data_filtered_all <- data %>%
+  mutate(pcr_pos = as.numeric(as.character(pcr_pos))) %>%
+  filter(!is.na(s_titer_geom), !is.na(pcr_pos), !is.na(percent_positive))
+
+all_predictions <- map_dfr(cutoffs, function(cutoff_val) {
+  data_cut <- data_filtered_all %>%
+    mutate(trans_cutoff = cut(percent_positive,
+                              breaks = c(-Inf, cutoff_val, Inf),
+                              labels = c("Low", "High"),
+                              include.lowest = TRUE)) %>%
+    filter(!is.na(trans_cutoff))
+
+  data_low <- data_cut %>% filter(trans_cutoff == "Low") %>% select(pcr_pos, s_titer_geom)
+  data_high <- data_cut %>% filter(trans_cutoff == "High") %>% select(pcr_pos, s_titer_geom)
+
+  pred_low <- generate_group_curve("Low", data_low, paste0("Cutoff = ", cutoff_val, "%"))
+  pred_high <- generate_group_curve("High", data_high, paste0("Cutoff = ", cutoff_val, "%"))
+
+  bind_rows(pred_low, pred_high)
+})
+
+# --- Plot ---
+figx <- ggplot(all_predictions, aes(x = Titer, y = RelativeRisk, color = Transmission)) +
+  geom_line(size = 0.7) +
+  geom_ribbon(aes(ymin = CI_low, ymax = CI_high, fill = Transmission), alpha = 0.15, color = NA) +
+  facet_wrap(~ Cutoff, ncol = 2) +
+  scale_color_manual(values = c("Low" = "#ff7f0e", "High" = "#1f77b4")) +
+  scale_fill_manual(values = c("Low" = "#ff7f0e", "High" = "#1f77b4")) +
+  labs(
+    title = NULL,
+    x = "S-antibody titer (log10)",
+    y = "Relative Risk"
+  ) +
+  coord_cartesian(xlim = c(0.1, 5), ylim = c(0, 1)) +
+  theme_minimal(base_size = 9) +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(size = 9, face = "bold"),
+    panel.spacing = unit(1.2, "lines"),
+    panel.border = element_rect(color = "gray", fill = NA, size = 0.2)
+  )
+
+print(figx)
+
+```
+
+##Figure S5
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(minpack.lm)
+library(purrr)
+library(ROSE)
+
+# --- Scaled logistic function ---
+scaled_logit_fn <- function(t, beta0, beta1, lambda) {
+  lambda / (1 + exp(beta0 * (t - beta1)))
+}
+
+# --- Fit model ---
+fit_scaled_logit <- function(df) {
+  tryCatch({
+    nlsLM(
+      pcr_pos ~ scaled_logit_fn(s_titer_geom, beta0, beta1, lambda),
+      data = df,
+      start = list(beta0 = 1.5, beta1 = 3, lambda = 0.5),
+      lower = c(-Inf, -Inf, 0),
+      upper = c(Inf, Inf, 1)
+    )
+  }, error = function(e) NULL)
+}
+
+# --- Bootstrap 95% CI ---
+bootstrap_scaled_logit <- function(df, n_boot = 200, titer_seq = seq(0.1, 5, 0.1)) {
+  boot_preds <- matrix(NA, nrow = n_boot, ncol = length(titer_seq))
+  for (i in 1:n_boot) {
+    boot_df <- df[sample(1:nrow(df), replace = TRUE), ]
+    fit <- fit_scaled_logit(boot_df)
+    if (!is.null(fit)) {
+      preds <- scaled_logit_fn(titer_seq,
+                               beta0 = coef(fit)["beta0"],
+                               beta1 = coef(fit)["beta1"],
+                               lambda = coef(fit)["lambda"])
+      boot_preds[i, ] <- preds / preds[1]
+    }
+  }
+  boot_ci <- apply(boot_preds, 2, function(x) quantile(x, probs = c(0.025, 0.975), na.rm = TRUE))
+  data.frame(
+    Titer = titer_seq,
+    CI_low = boot_ci[1, ],
+    CI_high = boot_ci[2, ]
+  )
+}
+
+# --- Generate predictions + CI per group ---
+generate_variant_curve <- function(group_df, variant_name, trans_level) {
+  titer_seq <- seq(0.1, 5, 0.1)
+  fit <- fit_scaled_logit(group_df)
+  if (is.null(fit)) return(NULL)
+
+  preds <- scaled_logit_fn(titer_seq,
+                           coef(fit)["beta0"],
+                           coef(fit)["beta1"],
+                           coef(fit)["lambda"]) / 
+           scaled_logit_fn(titer_seq,
+                           coef(fit)["beta0"],
+                           coef(fit)["beta1"],
+                           coef(fit)["lambda"])[1]
+
+  boot_ci <- bootstrap_scaled_logit(group_df, n_boot = 200, titer_seq = titer_seq)
+
+  data.frame(
+    Titer = titer_seq,
+    RelativeRisk = preds,
+    CI_low = boot_ci$CI_low,
+    CI_high = boot_ci$CI_high,
+    Variant = variant_name,
+    Transmission = trans_level
+  )
+}
+
+# --- Main loop over variant periods (no ROSE balancing) ---
+variant_levels <- c("Mu", "Delta", "BA.1", "BA.4/5")
+all_variant_curves <- list()
+
+for (v in variant_levels) {
+  df_v <- data %>% filter(variant_period == v)
+  df_low <- df_v %>% filter(transmission_intensity_biweek2 == "Low")
+  df_high <- df_v %>% filter(transmission_intensity_biweek2  == "High")
+
+  # Skip if sample size too small
+  if (nrow(df_low) < 50 | nrow(df_high) < 50) next
+
+  # Use original (unbalanced) data directly
+  curve_low <- generate_variant_curve(df_low, v, "Low")
+  curve_high <- generate_variant_curve(df_high, v, "High")
+
+  all_variant_curves[[v]] <- bind_rows(curve_low, curve_high)
+}
+
+# Combine all variant plots
+plot_df <- bind_rows(all_variant_curves)
+
+plot_df$Variant <- factor(plot_df$Variant, levels = variant_levels, ordered = TRUE)
+
+# --- Plot ---
+variant_plots <- ggplot(plot_df, aes(x = Titer, y = RelativeRisk, color = Transmission)) +
+  geom_line(size = 1.1) +
+  geom_ribbon(aes(ymin = pmax(0, CI_low), ymax = pmin(1, CI_high), fill = Transmission), alpha = 0.2, color = NA) +
+  facet_wrap(~Variant, ncol = 2) +
+  scale_color_manual(values = c("Low" = "#ff7f0e", "High" = "#1f77b4")) +
+  scale_fill_manual(values = c("Low" = "#ff7f0e", "High" = "#1f77b4")) +
+  scale_y_continuous(breaks = c(0, 0.25, 0.5, 0.75, 1), limits = c(0, 1)) +
+  labs(
+    title = NULL,
+    x = "Anti-Spike Antibody Titer (log10)",
+    y = "Relative Risk of PCR-Confirmed Infection"
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold")
+  )
+
+variant_plots <- variant_plots + base_nm_theme +
+  theme(legend.position = "bottom")
+
+variant_plots
+```
+
+##Figure S6
+
+```{r}
+
+library(truncnorm)
+library(ggplot2)
+library(dplyr)
+library(minpack.lm)
+library(patchwork)
+
+# Parameters
+set.seed(345)
+N <- 5000
+days <- 14
+low_exposure_rate <- 0.05
+high_exposure_rate <- 0.4
+
+# Define antibody distributions
+simulate_titers <- function(type = "unimodal") {
+  if (type == "unimodal") {
+    rtruncnorm(N, a = 0, mean = 2.5, sd = 0.8)
+  } else if (type == "bimodal") {
+    c(
+      rtruncnorm(N %/% 2, a = 0, mean = 1.5, sd = 0.4),
+      rtruncnorm(N - N %/% 2, a = 0, mean = 4.5, sd = 0.6)
+    )
+  } else if (type == "trimodal") {
+    seg <- N %/% 3
+    c(
+      rtruncnorm(seg, a = 0, mean = 1.2, sd = 0.3),
+      rtruncnorm(seg, a = 0, mean = 3.0, sd = 0.4),
+      rtruncnorm(N - 2 * seg, a = 0, mean = 4.5, sd = 0.3)
+    )
+  } else if (type == "seronegative_majority") {
+    c(
+      rtruncnorm(round(N * 0.8), a = 0, mean = 0.6, sd = 0.1),
+      rtruncnorm(N - round(N * 0.8), a = 0, mean = 3.0, sd = 0.7)
+    )
+  } else {
+    stop("Unknown distribution type")
+  }
+}
+
+# Infection risk function
+infection_risk_per_exposure <- function(t) {
+  1 / (1 + exp(1.5 * (t - 3)))
+}
+
+# Scaled logistic function
+scaled_logit_fn <- function(t, beta0, beta1, lambda) {
+  lambda / (1 + exp(beta0 *(t - beta1)))
+}
+
+# Simulation and plotting
+simulate_plot <- function(dist_type) {
+  titer <- simulate_titers(dist_type)
+  base_risk <- infection_risk_per_exposure(titer)
+  base_risk0 <- infection_risk_per_exposure(0)
+
+  # Add behavioral heterogeneity as a multiplier to exposure rate
+  behavior_factor <- rlnorm(N, meanlog = 0, sdlog = 0.5)  # mean ~1
+  exp_low <- rpois(N, lambda = low_exposure_rate * days * behavior_factor)
+  exp_high <- rpois(N, lambda = high_exposure_rate * days * behavior_factor)
+
+  inf_prob_low <- 1 - (1 - base_risk)^exp_low
+  inf_prob_high <- 1 - (1 - base_risk)^exp_high
+
+  inf_low <- rbinom(N, size = 1, prob = inf_prob_low)
+  inf_high <- rbinom(N, size = 1, prob = inf_prob_high)
+
+  df <- data.frame(
+    Titer = rep(titer, 2),
+    Infection = c(inf_low, inf_high),
+    Transmission = rep(c("Low", "High"), each = N)
+  ) %>% filter(Titer <= 5)
+
+  titer_density <- density(df$Titer, from = 0.1, to = 5)
+  density_df <- data.frame(Titer = titer_density$x, Density = titer_density$y / max(titer_density$y))
+
+  titer_seq <- seq(0,5,0.1)
+  df_risk_line <- data.frame(
+    Titer = titer_seq,
+    rel_exposure_risk = infection_risk_per_exposure(titer_seq)/base_risk0
+  )
+
+  df_pred <- df %>%
+    group_by(Transmission) %>%
+    do({
+      group_df <- .
+      fit <- tryCatch({
+        nlsLM(Infection ~ scaled_logit_fn(t = Titer, beta0, beta1, lambda),
+              data = group_df,
+              start = list(beta0 = 1.5, beta1 = 3, lambda = 0.5),
+              lower = c(-Inf, -Inf, 0),
+              upper = c(Inf, Inf, 1))
+      }, error = function(e) NULL)
+      if (is.null(fit)) return(data.frame())
+
+      t_seq <- seq(min(group_df$Titer), max(group_df$Titer), length.out = 200)
+      preds <- scaled_logit_fn(t_seq,
+                               beta0 = coef(fit)["beta0"],
+                               beta1 = coef(fit)["beta1"],
+                               lambda = coef(fit)["lambda"])
+      data.frame(Titer = t_seq, RelativeRisk = preds / preds[1], Transmission = unique(group_df$Transmission))
+    }) %>%
+    ungroup()
+
+  ggplot(df_pred, aes(x = Titer, y = RelativeRisk, color = Transmission)) +
+    geom_area(data = density_df, aes(x = Titer, y = Density), inherit.aes = FALSE,
+              fill = "lightgray", alpha = 0.4) +
+    geom_line(size = 0.9) +
+    geom_line(data = df_risk_line, aes(x = Titer, y = rel_exposure_risk),
+              color = "black", size = 1, linetype = "dotted", inherit.aes = FALSE) +
+    scale_color_manual(values = c("Low" = "#ff7f0e", "High" = "#1f77b4")) +
+    scale_fill_manual(values = c("Low" = "#ff7f0e", "High" = "#1f77b4")) +
+    labs(x = "Anti-Spike Antibody Titer", y = "Probability of Infection") +
+    coord_cartesian(xlim = c(0, 5), ylim = c(0, 1)) +
+    theme_light(base_size = 10) +
+    theme(
+      axis.text = element_text(size = 9),
+      axis.title = element_text(size = 9),
+      panel.grid.major.y = element_line(color = "grey90", size = 0.5),
+      panel.background = element_blank(),
+      legend.position = c(0.98, 0.5),
+      legend.justification = c(1, 0),
+      legend.background = element_rect(fill = "white", color = "gray"),
+      legend.text = element_text(size = 8),
+      legend.key.size = unit(0.5, "cm")
+    ) +
+    guides(fill = guide_none(), color = guide_legend(title = "Transmission intensity"))
+}
+
+
+# Generate individual plots
+g1 <- simulate_plot("unimodal") +
+  base_nm_theme +
+  labs(x = NULL) +  # Remove x-axis title for top left
+  theme(plot.tag.position = "topleft", legend.position = "bottom")
+
+g2 <- simulate_plot("bimodal") +
+  base_nm_theme +
+  labs(x = NULL, y = NULL) +  # Remove x-axis and y-axis title for top right
+  theme(plot.tag.position = "topleft", legend.position = "bottom")
+
+g3 <- simulate_plot("trimodal") +
+  base_nm_theme +
+  theme(plot.tag.position = "topleft", legend.position = "bottom")
+
+g4 <- simulate_plot("seronegative_majority") +
+  base_nm_theme +
+  labs(y = NULL) +  # Remove y-axis title for bottom right
+  theme(plot.tag.position = "topleft", legend.position = "bottom")
+
+# Combine into 2x2 layout
+total_combined <- (g1 + g2 + g3 + g4) +
+  plot_layout(ncol = 2, guides = "collect") +
+  plot_annotation(
+    tag_levels = 'A',
+    tag_prefix = "",
+    tag_suffix = ".",
+    theme = theme(plot.tag = element_text(face = "bold", size = 12))
+  ) &
+  theme(legend.position = "bottom")
+
+# Show
+total_combined
+
+```
