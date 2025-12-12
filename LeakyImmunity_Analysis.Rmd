@@ -1,5 +1,5 @@
 ---
-title: "r code for Exposure-dependent immune thresholds define protection across transmission intensities"
+title: "r code for Immune protection is exposure-dependent"
 output: html_notebook
 ---
 
