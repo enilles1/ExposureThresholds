@@ -15,7 +15,7 @@ output: html_notebook
 
 # ---- 0) Path ----
 
-file_path <- "data/TND_data.csv"
+file_path <- "TND_data.csv"
 
 
 # ---- 1) Read + normalization ----
