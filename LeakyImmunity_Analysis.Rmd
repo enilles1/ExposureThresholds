@@ -15,7 +15,8 @@ output: html_notebook
 
 # ---- 0) Path ----
 
-file_path <- '[insert filepath]'
+file_path <- "data/TND_data.csv"
+
 
 # ---- 1) Read + normalization ----
 df_raw <- read.csv(file_path) 
