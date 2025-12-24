@@ -1,11 +1,28 @@
-  library(readxl)
-  library(dplyr)
-  library(lubridate)
-  library(DescTools)
-  library(ggplot2)
-  has_DescTools <- requireNamespace("DescTools", quietly = TRUE)
+# 01_data_preparation.R
 
-df_raw <- read.csv("TND_data.csv") 
+## Packages
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(lubridate)
+  library(purrr)
+
+  library(ggplot2)
+  library(patchwork)
+
+  library(DescTools)
+  library(truncnorm)
+  library(minpack.lm)
+  library(ROSE)
+  library(mgcv)
+})
+
+# ---- 0) Path ----
+file_path <- "data/TND_data.csv"
+
+# ---- 1) Read + normalization ----
+df_raw <- read.csv(file_path, stringsAsFactors = FALSE)
 
 df <- df_raw %>%
   mutate(
@@ -15,6 +32,7 @@ df <- df_raw %>%
     province = as.factor(province)
   )
 
+# ---- 2) Primary analysis subset ----
 data <- df %>%
   filter(date > as.Date("2021-04-13")) %>%
   transmute(
@@ -30,6 +48,7 @@ data <- df %>%
                       right = FALSE)
   )
 
+# ---- 3) Biweekly percent positive (site/period transmission proxy) ----
 biweekly_data <- data %>%
   group_by(year_biweek) %>%
   summarise(
@@ -37,13 +56,16 @@ biweekly_data <- data %>%
     .groups = "drop"
   )
 
+# ---- 4) Join transmission intensity + keep periods with any positives ----
 data <- data %>%
   left_join(biweekly_data, by = "year_biweek") %>%
   filter(percent_positive > 0)
 
+# ---- 5) Valid-test window among PCR-positives (avoid early anamnestic response bias) ----
 data <- data %>%
   filter(pcr_pos == 0 | (pcr_pos == 1 & dpso < 5))
 
+# ---- 6) Variant period + transmission strata ----
 data <- data %>%
   mutate(
     variant_period = case_when(
@@ -65,6 +87,7 @@ data <- data %>%
     )
   )
 
+# ---- 7) PCR positivity summary table by transmission intensity ----
 pcr_summary <- data %>%
   group_by(transmission_intensity_biweek2) %>%
   summarise(
@@ -78,6 +101,7 @@ pcr_summary <- data %>%
   ) %>%
   janitor::adorn_totals("row")
 
+# ---- 8) Interactions, bins) ----
 data <- data %>%
   mutate(
     dpv_vacc_interaction = interaction(dpv, vaccinated, drop = TRUE),
@@ -91,6 +115,11 @@ data <- data %>%
     )
   )
 
+# 02_summary_stats.R
+
+has_DescTools <- requireNamespace("DescTools", quietly = TRUE)
+
+# ---------- 1) Transmission summaries by variant period ----------
 summary_transmission_by_variant <- data %>%
   group_by(variant_period) %>%
   summarise(
@@ -106,7 +135,7 @@ summary_transmission_by_variant <- data %>%
 
 print(summary_transmission_by_variant)
 
-
+# ---------- 2) Overall study period length (by observed dates) ----------
 study_start <- min(data$date, na.rm = TRUE)
 study_end   <- max(data$date, na.rm = TRUE)
 n_weeks_span <- as.numeric(difftime(study_end, study_start, units = "weeks"))
@@ -212,17 +241,10 @@ titer_by_trans <- dplyr::bind_rows(
   by_trans_group(data_high, "High")
 )
 
-```
 
 # 03_figures_tables_main.R
 
 ## Table 1
-
-```{r}
-suppressPackageStartupMessages({
-  library(dplyr)
-  library(tidyr)
-})
 
 # ---- Helpers (define ONCE, before using) ----
 gmean_ci <- function(x, conf.level = 0.95) {
@@ -254,6 +276,7 @@ summarise_titer_block <- function(df) {
 }
 
 # Common factor for NAAT with explicit order
+                 
 data <- data %>%
   mutate(naat = factor(pcr_pos, levels = c(0,1), labels = c("Negative","Positive")))
 
@@ -312,11 +335,9 @@ final_table <- bind_rows(table_results, totals_row) %>%
 
 print(final_table)
 
-```
 
 ##Figure 1 Plot 1A
 
-```{r}
 # Convert to an unordered factor first
 data$variant_period <- factor(data$variant_period, 
                               levels = c("Mu", "Delta", "BA.1", "BA.4/5"), 
@@ -423,11 +444,9 @@ fig2a <- ggplot(model_results, aes(y = Variable)) +
 
 print(fig2a)
 
-```
 
-Plot 1B
+#Plot 1B
 
-```{r}
 # Mean, SEM, and 95% CI
 data_summary <- data %>%
   group_by(transmission_intensity_biweek2, pcr_pos) %>%
@@ -483,13 +502,7 @@ fig2b <- ggplot() +
 
 print(fig2b)
 
-
-
-```
-
-Plot 1C
-
-```{r}
+#Plot 1C
 
 Gmean <- function(x) exp(mean(log(x[x > 0]), na.rm = TRUE))
 
@@ -597,16 +610,7 @@ participant_summary <- data_inc_all %>%
 print(participant_summary)
 
 
-```
-
-Plot 1D
-
-```{r}
-
-library(dplyr)
-library(ggplot2)
-library(lubridate)
-library(patchwork)
+#Plot 1D
 
 # Step 1: Separate positive and negative cases
 data_pos <- data %>% filter(pcr_pos == 1)
@@ -639,7 +643,7 @@ combined_data$variant_period <- factor(
   levels = c("Overall", "Mu", "Delta", "BA.1", "BA.4/5")
 )
 
-# Define Nature Medicine style base theme
+# Define style base theme
 base_nm_theme <- theme_minimal(base_size = 9) +
   theme(
     strip.background = element_blank(),
@@ -695,17 +699,8 @@ Figure2_final <- top_row / middle_row / bottom_row + plot_layout(heights = c(1, 
 # Print figure
 print(Figure2_final)
 
-```
 
 ##Figure 2 Plots 2A+2B
-
-```{r}
-library(dplyr)
-library(ggplot2)
-library(minpack.lm)
-library(purrr)
-library(patchwork)
-library(ROSE)
 
 # --- Scaled logistic function ---
 scaled_logit_fn <- function(t, beta0, beta1, lambda) {
@@ -842,11 +837,8 @@ final_plot <- p1_mod + p2_mod +
 
 print(final_plot)
 
-```
+#Model metrics
 
-Model metrics
-
-```{r}
 # Function to assess model fit
 assess_model_fit <- function(fit, data_used, group_name) {
   if (is.null(fit)) {
@@ -895,21 +887,9 @@ model_diagnostics <- bind_rows(
   assess_model_fit(fit_high_bal, data_high_bal, "High (Balanced)")
 )
 
-# View the table
 print(model_diagnostics)
-
-
-```
-
+                   
 ## Figure 3
-
-```{r}
-
-library(truncnorm)
-library(ggplot2)
-library(dplyr)
-library(minpack.lm)
-library(patchwork)
 
 # Parameters
 set.seed(345)
@@ -1095,13 +1075,7 @@ total_combined <- (g1 + g2 + g3 + g4) +
 # Show
 print(total_combined)
 
-```
-
 ##Figure 4
-
-```{r}
-library(dplyr)
-library(ggplot2)
 
 # grid over VE and Exposures for each p_base
 grid <- expand.grid(
@@ -1150,16 +1124,11 @@ veff_plot <- ggplot(det_all,
 # Display the plot
 print(veff_plot)
 
-
-```
-
 # 04_figures_tables_supplement.R
 
 ## Table S1
 
-```{r}
 suppressPackageStartupMessages({
-  library(dplyr)
   library(tidyr)
   library(forcats)
 })
@@ -1215,17 +1184,15 @@ final_summary <- bind_rows(lapply(variables, make_block))
 # Preview
 print(final_summary, n = nrow(final_summary))
 
-```
-
 ##Figure S2 Plot S2A
 
-```{r}
+
 # Convert to an unordered factor first
 data$variant_period <- factor(data$variant_period, 
                               levels = c("Mu", "Delta", "BA.1", "BA.4/5"), 
                               ordered = FALSE)  # This removes the "ordered" attribute
 
-# Now set "Mu" as the reference level
+# Set "Mu" as the reference level
 data$variant_period <- relevel(data$variant_period, ref = "Mu")
 
 
@@ -1237,7 +1204,7 @@ data$s_titer_geom_cat <- cut(data$s_titer_geom,
                                            labels = c("Q1", "Q2", "Q3", "Q4"),
                                            include.lowest = TRUE)
 
-# Filter out the undesired dose
+# Filter out vd =4
 data_model_overall <- data %>%
   filter(vacc_dose != '4')
 
@@ -1331,18 +1298,9 @@ forestplot_combined2 <- ggplot(model_results, aes(y = Variable)) +
 print(forestplot_combined2)
 
 
+#Plot S2B
 
-
-```
-
-Plot S2B
-
-```{r}
-# --- Prepare model output (again) ---
-library(mgcv)
-library(dplyr)
-library(ggplot2)
-library(tibble)
+# --- Prepare model output ---
 
 # --- Refit model excluding S-antibody titer variable ---
 overall_model_gam_no_titer <- mgcv::gam(
@@ -1451,16 +1409,11 @@ forestplot_no_titer <- ggplot(results_df_no_titer, aes(y = Variable)) +
   coord_cartesian(xlim = c(0.1, 35))
 
 print(forestplot_no_titer)
-
-
-```
-
+                
 ##Figure S3
 
-```{r}
+
 # ---- Boxplots: 5 sub-plots; each shows Low vs High ----
-library(ggplot2)
-library(dplyr)
 
 # Colors (lightened tints to match your ridge figure style)
 col_high  <- "#6baed6"  # lighter blue
@@ -1539,15 +1492,7 @@ p_box5 <- p_box5 +
     size = 2.4, vjust = 0
   )
 
-```
-
 ##Figure S4
-
-```{r}
-library(dplyr)
-library(ggplot2)
-library(minpack.lm)
-library(purrr)
 
 # --- Logistic function ---
 scaled_logit_fn <- function(t, beta0, beta1, lambda) {
@@ -1672,16 +1617,7 @@ figx <- ggplot(all_predictions, aes(x = Titer, y = RelativeRisk, color = Transmi
 
 print(figx)
 
-```
-
 ##Figure S5
-
-```{r}
-library(dplyr)
-library(ggplot2)
-library(minpack.lm)
-library(purrr)
-library(ROSE)
 
 # --- Scaled logistic function ---
 scaled_logit_fn <- function(t, beta0, beta1, lambda) {
@@ -1797,17 +1733,8 @@ variant_plots <- variant_plots + base_nm_theme +
   theme(legend.position = "bottom")
 
 variant_plots
-```
 
 ##Figure S6
-
-```{r}
-
-library(truncnorm)
-library(ggplot2)
-library(dplyr)
-library(minpack.lm)
-library(patchwork)
 
 # Parameters
 set.seed(345)
@@ -1964,4 +1891,4 @@ total_combined <- (g1 + g2 + g3 + g4) +
   theme(legend.position = "bottom")
 
 # Show
-total_combined
+print(total_combined)
