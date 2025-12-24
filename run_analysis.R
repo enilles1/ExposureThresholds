@@ -420,7 +420,7 @@ model_results$Colors <- c(
 annotation_x_position <- 11
 
 # ---- Step 3: Forest Plot ----
-fig2a <- ggplot(model_results, aes(y = Variable)) +
+fig1a <- ggplot(model_results, aes(y = Variable)) +
   geom_point(aes(x = OR, color = Colors), size = 3, shape = 22) +
   geom_errorbar(aes(xmin = LowerCI, xmax = UpperCI, color = Colors), width = 0.2) +
   geom_vline(xintercept = 1, linetype = "dashed", color = "black") +
@@ -442,7 +442,7 @@ fig2a <- ggplot(model_results, aes(y = Variable)) +
   labs(title = 'A. Odds ratios for testing PCR positive', x = "", y = NULL) +
   coord_cartesian(xlim = c(0.1, 35))
 
-print(fig2a)
+print(fig1a)
 
 
 #Plot 1B
@@ -473,7 +473,7 @@ data_summary$adjusted_lower <- ifelse(data_summary$pcr_pos == 1, data_summary$lo
 data_summary$adjusted_upper <- ifelse(data_summary$pcr_pos == 1, data_summary$upper - data_summary$mean_value, data_summary$upper - data_summary$mean_titer_pos)
 
 # Adjusted plot stratified by variant with Lancet-style
-fig2b <- ggplot() +
+fig1b <- ggplot() +
   geom_point(data = data_summary, 
              aes(x = transmission_intensity_biweek2, y = adjusted_mean, 
                  color = factor(pcr_pos, labels = c("Pos", "Neg")),
@@ -500,7 +500,7 @@ fig2b <- ggplot() +
    theme(legend.position = c(1, 0.762),legend.justification = c(1, 0),  
         legend.background = element_rect(fill = "white", color = "gray"), legend.text = element_text(size = 6),  legend.key.size = unit(0.3, "cm"))
 
-print(fig2b)
+print(fig1b)
 
 #Plot 1C
 
@@ -541,7 +541,7 @@ data_inc_all <- data_inc_all %>%
     transmission_intensity_biweek2 = factor(transmission_intensity_biweek2, levels = c("Low", "Med", "High", "NA")))
 
 
-fig2c <- ggplot(data_inc_all, aes(x = transmission_intensity_biweek2, y = s_titer_geom)) +
+fig1c <- ggplot(data_inc_all, aes(x = transmission_intensity_biweek2, y = s_titer_geom)) +
   geom_boxplot(
     aes(fill = factor(pcr_pos)),
     alpha = 0.2,
@@ -571,7 +571,7 @@ fig2c <- ggplot(data_inc_all, aes(x = transmission_intensity_biweek2, y = s_tite
   labs(title = 'C. Antibody titer by variant, transmission intensity, and PCR result')+
   facet_wrap(~ variant_period, scales = "free_x", nrow = 1)
 
-print(fig2c)
+print(fig1c)
 
 # Participant counts
 
@@ -665,7 +665,7 @@ no_grid_theme <- base_nm_theme + theme(panel.grid = element_blank())
 
 
 # Step 6: Define fig2c
-fig2d <- ggplot(combined_data, aes(x = percent_positive, y = titer_diff)) +
+fig1d <- ggplot(combined_data, aes(x = percent_positive, y = titer_diff)) +
   # Density shading (rescaled to Y axis range)
 #  stat_density(data = combined_data,aes(x = percent_positive, y = after_stat(scaled) * max(combined_data$titer_diff, na.rm = TRUE) * 0.3),fill = "#003f5c",alpha = 0.1,inherit.aes = FALSE) +
   # Main GAM smooth line
@@ -683,22 +683,21 @@ fig2d <- ggplot(combined_data, aes(x = percent_positive, y = titer_diff)) +
   base_nm_theme
 
 # Apply themes accordingly
-fig2a <- fig2a + no_grid_theme
-fig2b <- fig2b
-fig2c <- fig2c + base_nm_theme
-fig2d <- fig2d + base_nm_theme
+fig1a <- fig1a + no_grid_theme
+fig1b <- fig1b
+fig1c <- fig1c + base_nm_theme
+fig1d <- fig1d + base_nm_theme
 
 # Combine rows
-top_row <- fig2a + fig2b + plot_layout(ncol = 2, widths = c(3.2, 1))
-middle_row <- fig2c + plot_layout(ncol = 1)
-bottom_row <- fig2d + plot_layout(ncol = 1)
+top_row <- fig1a + fig1b + plot_layout(ncol = 2, widths = c(3.2, 1))
+middle_row <- fig1c + plot_layout(ncol = 1)
+bottom_row <- fig1d + plot_layout(ncol = 1)
 
 # Final combined figure
-Figure2_final <- top_row / middle_row / bottom_row + plot_layout(heights = c(1, 1, 1))
+Figure1_final <- top_row / middle_row / bottom_row + plot_layout(heights = c(1, 1, 1))
 
 # Print figure
-print(Figure2_final)
-
+ggsave("Figure2.tiff", Figure1_final)
 
 ##Figure 2 Plots 2A+2B
 
@@ -831,11 +830,11 @@ p1_mod <- p1 + base_nm_theme +
 p2_mod <- p2 + base_nm_theme + 
   theme(legend.position = "bottom")
 
-final_plot <- p1_mod + p2_mod +
+fig2 <- p1_mod + p2_mod +
   plot_layout(ncol = 2, guides = "collect") &
   theme(legend.position = "bottom")
 
-print(final_plot)
+ggsave("Figure2.tiff", fig2)
 
 #Model metrics
 
@@ -1062,7 +1061,7 @@ g4 <- simulate_plot("seronegative_majority") +
   theme(plot.tag.position = "topleft", legend.position = "bottom")
 
 # Combine into 2x2 layout
-total_combined <- (g1 + g2 + g3 + g4) +
+fig3 <- (g1 + g2 + g3 + g4) +
   plot_layout(ncol = 2, guides = "collect") +
   plot_annotation(
     tag_levels = 'A',
@@ -1073,7 +1072,7 @@ total_combined <- (g1 + g2 + g3 + g4) +
   theme(legend.position = "bottom")
 
 # Show
-print(total_combined)
+ggsave("Figure3.tiff", fig3)
 
 ##Figure 4
 
@@ -1098,7 +1097,7 @@ det_all <- grid %>%
   )
 
 # plot: no loess, just lines; ribbons as horizontal CIs in x (like your original)
-veff_plot <- ggplot(det_all,
+fig4 <- ggplot(det_all,
   aes(x = mean, y = VE * 100, group = factor(Exposures),
       color = factor(Exposures), fill = factor(Exposures))) +
   geom_ribbon(aes(xmin = lwr, xmax = upr), alpha = 0.2, color = NA) +
@@ -1122,7 +1121,7 @@ veff_plot <- ggplot(det_all,
   )
 
 # Display the plot
-print(veff_plot)
+ggsave("Figure4.tiff", fig4)
 
 # 04_figures_tables_supplement.R
 
@@ -1273,7 +1272,7 @@ x_max <- max(model_results$UpperCI[is.finite(model_results$UpperCI)], na.rm = TR
 annotation_x_position <- x_max * 1.15
 x_upper <- max(35, annotation_x_position * 1.05)  # keep your 35 if smaller
 
-forestplot_combined2 <- ggplot(model_results, aes(y = Variable)) +
+figs2a <- ggplot(model_results, aes(y = Variable)) +
   geom_point(aes(x = OR, color = Colors), size = 3, shape = 22, na.rm = TRUE) +
   geom_errorbar(aes(xmin = LowerCI, xmax = UpperCI, color = Colors), width = 0.2, na.rm = TRUE) +
   geom_vline(xintercept = 1, linetype = "dashed", color = "black") +
@@ -1295,7 +1294,7 @@ forestplot_combined2 <- ggplot(model_results, aes(y = Variable)) +
   labs(title = "A. Odds ratios for testing PCR positive (S-antibody included)", x = "", y = NULL) +
   coord_cartesian(xlim = c(0.1, x_upper))
 
-print(forestplot_combined2)
+ggsave("FigureS2A.tiff", figs2a)
 
 
 #Plot S2B
@@ -1386,7 +1385,7 @@ results_df_no_titer <- results_df_no_titer %>%
 max_upper_ci_no_titer <- max(results_df_no_titer$UpperCI, na.rm = TRUE)
 annotation_x_position_no_titer <- max_upper_ci_no_titer * 1.3
 
-forestplot_no_titer <- ggplot(results_df_no_titer, aes(y = Variable)) +
+figs2b <- ggplot(results_df_no_titer, aes(y = Variable)) +
   geom_point(aes(x = OR, color = Colors), size = 3, shape = 22, na.rm = TRUE) +
   geom_errorbar(aes(xmin = LowerCI, xmax = UpperCI, color = Colors), width = 0.2, na.rm = TRUE) +
   geom_vline(xintercept = 1, linetype = "dashed", color = "black") +
@@ -1408,7 +1407,7 @@ forestplot_no_titer <- ggplot(results_df_no_titer, aes(y = Variable)) +
   expand_limits(x = c(0.01, annotation_x_position_no_titer * 1.5)) +
   coord_cartesian(xlim = c(0.1, 35))
 
-print(forestplot_no_titer)
+ggsave("FigureS2A.tiff", figs2b)
                 
 ##Figure S3
 
@@ -1595,7 +1594,7 @@ all_predictions <- map_dfr(cutoffs, function(cutoff_val) {
 })
 
 # --- Plot ---
-figx <- ggplot(all_predictions, aes(x = Titer, y = RelativeRisk, color = Transmission)) +
+figs4 <- ggplot(all_predictions, aes(x = Titer, y = RelativeRisk, color = Transmission)) +
   geom_line(size = 0.7) +
   geom_ribbon(aes(ymin = CI_low, ymax = CI_high, fill = Transmission), alpha = 0.15, color = NA) +
   facet_wrap(~ Cutoff, ncol = 2) +
@@ -1615,7 +1614,7 @@ figx <- ggplot(all_predictions, aes(x = Titer, y = RelativeRisk, color = Transmi
     panel.border = element_rect(color = "gray", fill = NA, size = 0.2)
   )
 
-print(figx)
+ggsave("FigureS4.tiff", figs4)
 
 ##Figure S5
 
@@ -1711,7 +1710,7 @@ plot_df <- bind_rows(all_variant_curves)
 plot_df$Variant <- factor(plot_df$Variant, levels = variant_levels, ordered = TRUE)
 
 # --- Plot ---
-variant_plots <- ggplot(plot_df, aes(x = Titer, y = RelativeRisk, color = Transmission)) +
+figs5 <- ggplot(plot_df, aes(x = Titer, y = RelativeRisk, color = Transmission)) +
   geom_line(size = 1.1) +
   geom_ribbon(aes(ymin = pmax(0, CI_low), ymax = pmin(1, CI_high), fill = Transmission), alpha = 0.2, color = NA) +
   facet_wrap(~Variant, ncol = 2) +
@@ -1732,7 +1731,7 @@ variant_plots <- ggplot(plot_df, aes(x = Titer, y = RelativeRisk, color = Transm
 variant_plots <- variant_plots + base_nm_theme +
   theme(legend.position = "bottom")
 
-variant_plots
+ggsave("FigureS5.tiff", figs5)
 
 ##Figure S6
 
@@ -1880,7 +1879,7 @@ g4 <- simulate_plot("seronegative_majority") +
   theme(plot.tag.position = "topleft", legend.position = "bottom")
 
 # Combine into 2x2 layout
-total_combined <- (g1 + g2 + g3 + g4) +
+figs6 <- (g1 + g2 + g3 + g4) +
   plot_layout(ncol = 2, guides = "collect") +
   plot_annotation(
     tag_levels = 'A',
@@ -1891,4 +1890,4 @@ total_combined <- (g1 + g2 + g3 + g4) +
   theme(legend.position = "bottom")
 
 # Show
-print(total_combined)
+ggsave("FigureS6.tiff", figs6)
